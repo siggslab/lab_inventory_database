@@ -1,0 +1,63 @@
+"""Unit tests for unit arithmetic and id minting."""
+
+from __future__ import annotations
+
+import pytest
+
+from inventory_mcp import ids, units
+
+
+class TestUnits:
+    def test_volume_converts_to_ul(self):
+        assert units.to_canonical("volume", 1.0, "ml") == (1000.0, "ul")
+        assert units.to_canonical("volume", 2.0, "ul") == (2.0, "ul")
+
+    def test_micro_sign_variants_are_equivalent(self):
+        assert units.to_canonical("volume", 5.0, "µl") == units.to_canonical("volume", 5.0, "ul")
+
+    def test_mass_and_concentration_are_separate_dimensions(self):
+        assert units.to_canonical("mass", 1.0, "ug") == (1000.0, "ng")
+        # ug/ml and ng/ul are the same concentration -- this must hold or every
+        # historical record becomes incomparable.
+        assert units.to_canonical("concentration_mass", 1.0, "ug/ml") == (1.0, "ng/ul")
+
+    def test_wrong_dimension_is_rejected_not_passed_through(self):
+        with pytest.raises(units.UnitError):
+            units.to_canonical("volume", 49.0, "ng/ul")
+
+    def test_unknown_unit_lists_alternatives(self):
+        with pytest.raises(units.UnitError) as e:
+            units.to_canonical("mass", 1.0, "furlongs")
+        assert "Known:" in str(e.value)
+
+    def test_unitless_quantities_accept_their_placeholders(self):
+        assert units.is_known_unit("cell_count", "")
+        assert units.is_known_unit("viability", "%")
+        value, canon = units.to_canonical("cell_count", 5.3, "")
+        assert (value, canon) == (5.3, "cells")
+
+    def test_compatible_quantity_hint(self):
+        assert "volume" in units.compatible_quantity("ml")
+
+
+class TestIds:
+    def test_round_trip(self):
+        value = ids.new_id("smp")
+        assert ids.parse_id(value) == ("smp", value.split("_")[1])
+
+    def test_ambiguous_characters_absent(self):
+        for _ in range(200):
+            value = ids.new_id("smp")
+            suffix = value.split("_")[1]
+            assert not set(suffix) & set("ilou"), value
+
+    def test_rejects_human_labels(self):
+        assert ids.parse_id("GML001631") is None
+        assert ids.parse_id("-70C Misc") is None
+        assert ids.parse_id("smp_short") is None
+        assert ids.looks_like_human_label("GML001631")
+
+    def test_prefix_check(self):
+        value = ids.new_id("kit")
+        assert ids.is_valid_id(value, "kit")
+        assert not ids.is_valid_id(value, "smp")

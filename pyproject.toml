@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inventory-mcp"
+version = "0.1.0"
+description = "On-device MCP server over a CSV-backed biological sample and lab inventory database"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.2.0",
+]
+
+[project.optional-dependencies]
+drive = [
+    "google-auth>=2.23",
+    "google-auth-oauthlib>=1.0",
+    "google-api-python-client>=2.100",
+]
+dev = [
+    "pytest>=7.4",
+]
+
+[project.scripts]
+inventory-mcp = "inventory_mcp.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["inventory_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

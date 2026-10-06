@@ -1,0 +1,22 @@
+# Environments and build artefacts
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.qwen/
+
+# Regenerable development database: `inventory-mcp init --root .devdb --seed`
+.devdb/
+
+# Credentials belong on the machine, not in history
+client_secret*.json
+service_account*.json
+oauth_token.json
+
+# Legacy Airtable snapshot (the Drive download), kept locally for schema
+# reference only. Real participant data — must never reach a git remote.
+drive-download-*/
+drive-download-*.zip

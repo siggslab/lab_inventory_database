@@ -1,0 +1,11 @@
+{
+  "backend": "local",
+  "local_root": ".devdb",
+  "drive_folder_id": "",
+  "drive_file_ids": {},
+  "token_path": "/home/yves/.config/inventory-mcp/oauth_token.json",
+  "client_secret_path": "/home/yves/.config/inventory-mcp/client_secret.json",
+  "cache_ttl_seconds": 5.0,
+  "keep_backups": 20,
+  "actor": "yves"
+}
