@@ -41,8 +41,12 @@ What varies is who touches the console and how often.
    `~/.config/inventory-mcp/client_secret.json`. Every user then runs
    `inventory-mcp auth` and signs in with their institute account. Desktop-app client
    ids are not treated as secrets by Google, so that file can live in an internal repo.
-   Friction: the "app isn't verified" interstitial on first consent, and refresh tokens
-   expire after ~7 days while the app sits in Testing (`auth --force`).
+   Consent-screen user type: **Internal** if the GCP project sits under the institute's
+   organisation (same domain as the RAs' accounts) — then every RA authorises with their
+   institute account, there is no test-user list, and no 7-day refresh-token expiry.
+   Fall back to **External + Testing** only if the project cannot be placed in the
+   institute's org (otherwise Internal locks the RAs out); accept the test-user list and
+   periodic `auth --force` in that case.
 2. **Service account** (also already supported — `service_account_path` wins over the
    OAuth flow). Key created once by the project owner, folder shared with that address.
    Zero prompts forever. Cost: writes are attributed to one robot identity in Drive's
