@@ -98,7 +98,7 @@ class DriveStoreBase(TableStore):
     def describe(self) -> str:
         return f"{self.kind}:drive-folder:{self.folder_id}"
 
-    def _retry(self, request, *, attempts: int = 4):
+    def _retry(self, request, *, attempts: int = 8):
         """Run an ApiRequest, backing off on the transient statuses."""
         delay = 0.5
         for i in range(attempts):
@@ -109,7 +109,12 @@ class DriveStoreBase(TableStore):
                 if status is None and HttpError is not None and isinstance(exc, HttpError):
                     status = exc.resp.status if getattr(exc, "resp", None) else None
                 if status in _RETRY_STATUS and i < attempts - 1:
-                    time.sleep(delay)
+                    # Sheets quota is 60 reads/min/user; waiting 30s+ lets the
+                    # window reset rather than burning through retries.
+                    if status == 429:
+                        time.sleep(max(delay, 30))
+                    else:
+                        time.sleep(delay)
                     delay *= 2
                     continue
                 raise self._as_store_error(exc) from exc
@@ -341,8 +346,10 @@ class DriveCsvStore(DriveStoreBase):
                 "Either switch this database to backend='drive_sheets' or re-create "
                 "it as CSV."
             )
-        media = self._retry(self._drive.files().get_media(fileId=fid))
-        text = media.read().decode("utf-8-sig")
+        # execute() hands back the body as plain bytes; there is no stream
+        # object unless a custom http transport is injected (observed live).
+        blob = self._retry(self._drive.files().get_media(fileId=fid))
+        text = blob.decode("utf-8-sig")
         return _parse_csv(text, name)
 
     def _push(self, name: str, header: tuple[str, ...], rows: list[Row]) -> str:
@@ -448,11 +455,23 @@ class DriveSheetsStore(DriveStoreBase):
     def _fetch(self, name: str) -> TableData:
         fid, meta = self._meta(name)
         title = self.tab_name(name)
-        if title not in self._titles(meta):
-            # A spreadsheet with no tab of ours yet is an empty table, not an error:
-            # that is the state immediately after creation.
-            return TableData(name=name, header=(), rows=(),
-                             revision=compute_revision((), ()))
+        titles = self._titles(meta)
+        if title not in titles:
+            if not titles or set(titles) <= {"Sheet1", "Sheet 1"}:
+                # A spreadsheet with no tab of ours yet is an empty table, not an
+                # error: that is the state immediately after creation, when Drive
+                # gives the file a default "Sheet1" and nothing more.
+                return TableData(name=name, header=(), rows=(),
+                                 revision=compute_revision((), ()))
+            # Other tabs but not ours means someone renamed or deleted it. Reading
+            # that as empty would let the next commit "succeed" by overwriting a
+            # table whose real content is sitting right there under a new name.
+            raise StoreError(
+                f"table {name!r}: spreadsheet {fid} has tab(s) "
+                f"({', '.join(sorted(titles))}) but none named {title!r}. "
+                "A tab was renamed or deleted by hand -- refusing to read the "
+                "table as empty; restore the tab name or decide deliberately."
+            )
         resp = self._retry(
             self._sheets.spreadsheets().values().get(
                 spreadsheetId=fid, range=f"'{title}'!A1:ZZZ",
@@ -495,7 +514,7 @@ class DriveSheetsStore(DriveStoreBase):
                 valueInputOption="RAW", includeValuesInResponse=False,
             )
         )
-        self._trim_below(fid, title, len(grid))
+        self._clear_below(fid, title, len(grid))
         self._listing = None
         return compute_revision(header, rows)
 
@@ -515,37 +534,24 @@ class DriveSheetsStore(DriveStoreBase):
         self.invalidate()
         return created["id"]
 
-    def _trim_below(self, spreadsheet_id: str, title: str, keep_rows: int) -> None:
-        """Delete rows past the new content so stale rows can't survive a shrink."""
-        meta = self._retry(
-            self._sheets.spreadsheets().get(
+    def _clear_below(self, spreadsheet_id: str, title: str, keep_rows: int) -> None:
+        """Blank every row under the new content so a shrink leaves nothing stale.
+
+        Deliberately not deleteDimension: a spreadsheet created through the Drive
+        API reports no gridProperties.rowCount -- not even after it has been
+        written through Sheets (observed live) -- so the grid size cannot be
+        known here, and a fields filter asking for that path 400s. Clearing an
+        open-ended A1 range needs no grid knowledge; the blank rows come back as
+        empty cells, which _fetch trims and load() ignores. The rows themselves
+        remain in the grid, so a hand edit far below the data reads back as an
+        all-empty row and doctor flags it rather than silently absorbing it.
+        """
+        self._retry(
+            self._sheets.spreadsheets().values().clear(
                 spreadsheetId=spreadsheet_id,
-                fields="sheets.properties.sheetId,sheets.gridProperties.rowCount,"
-                       "sheets.properties.title",
+                range=f"'{title}'!A{keep_rows + 1}:ZZZ",
             )
         )
-        sheet = next(
-            (s for s in meta.get("sheets", [])
-             if s.get("properties", {}).get("title") == title),
-            None,
-        )
-        if not sheet:
-            return
-        sheet_id = sheet["properties"]["sheetId"]
-        available = int(sheet.get("gridProperties", {}).get("rowCount", 0) or 0)
-        if available > keep_rows:
-            self._retry(
-                self._sheets.spreadsheets().batchUpdate(
-                    spreadsheetId=spreadsheet_id,
-                    body={"requests": [{"deleteDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "ROWS",
-                            "startIndex": keep_rows,
-                            "endIndex": available,
-                        }}}]},
-                )
-            )
 
 
 def _column_letter(width: int) -> str:

@@ -1,10 +1,10 @@
 {
   "backend": "local",
   "local_root": ".devdb",
-  "drive_folder_id": "",
+  "drive_folder_id": "16QfHIYtRsQBmtvs77Ke-zL5uvxBNUEm6",
   "drive_file_ids": {},
-  "token_path": "/home/yves/.config/inventory-mcp/oauth_token.json",
-  "client_secret_path": "/home/yves/.config/inventory-mcp/client_secret.json",
+  "token_path": "./.creds/oauth_token.json",
+  "client_secret_path": "./.creds/lab_inv_test_credentials.json",
   "cache_ttl_seconds": 5.0,
   "keep_backups": 20,
   "actor": "yves"

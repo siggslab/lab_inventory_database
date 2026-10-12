@@ -12,6 +12,7 @@ dist/
 .devdb/
 
 # Credentials belong on the machine, not in history
+.creds/
 client_secret*.json
 service_account*.json
 oauth_token.json

@@ -1275,8 +1275,25 @@ class Service:
                 rows = [{k: v for k, v in r.items() if k != EXTRA_COLUMNS_KEY} for r in t.rows]
                 new_rev = self.store.write_table(name, t.header, rows, t.revision or None)
                 new_revisions[name] = new_rev
-        except RevisionConflict as e:
-            raise Conflict(f"{e}\nBackup of the pre-write state: {snapshot.path or 'n/a'}") from e
+        except StoreError as e:
+            # A commit that cannot finish must leave nothing half-landed: any
+            # table already pushed by this loop goes back to its pre-commit
+            # content. Live finding: the CAS failure used to surface only after
+            # the earlier tables had been written, orphaning rows across tables.
+            reverted, stuck = self._rollback(new_revisions)
+            detail = ""
+            if reverted:
+                detail += f"\nReverted: {', '.join(reverted)}."
+            if stuck:
+                detail += (f"\nCOULD NOT REVERT: {', '.join(stuck)} -- they changed "
+                           "again while this commit was aborting. Run doctor before "
+                           "writing more; do not overwrite by hand.")
+            backup = f"\nBackup of the pre-write state: {snapshot.path or 'n/a'}"
+            if isinstance(e, RevisionConflict):
+                raise Conflict(f"{e}{detail}{backup}") from e
+            if detail:
+                raise StoreError(f"{e}{detail}") from e
+            raise
 
         self._db = candidate
         for name in touched:
@@ -1291,6 +1308,28 @@ class Service:
             snapshot=snapshot,
             warnings=[v.as_dict() for v in warns],
         )
+
+    def _rollback(self, written: dict[str, str]) -> tuple[list[str], list[str]]:
+        """Put tables already pushed by an aborted commit back as they were.
+
+        ``written`` maps table -> the revision our own push produced. We CAS
+        against that value, so if a human or another session wrote again in the
+        meantime their change wins and the table is reported as stuck rather
+        than bulldozed by the undo. A table this commit *created* cannot be
+        deleted through the store API; it is emptied instead, which matches the
+        freshly-initialised shape.
+        """
+        reverted: list[str] = []
+        stuck: list[str] = []
+        for name, rev in written.items():
+            t = self.db.tables[name]  # still the pre-commit view
+            rows = [{k: v for k, v in r.items() if k != EXTRA_COLUMNS_KEY} for r in t.rows]
+            try:
+                self.store.write_table(name, t.header, rows, rev)
+                reverted.append(name)
+            except StoreError:
+                stuck.append(name)
+        return reverted, stuck
 
     def _snapshot(self, tables: Iterable[str], operation: str) -> Snapshot:
         """Copy the pre-write content of the tables we are about to change.

@@ -17,8 +17,8 @@ completely or does not happen at all.
 | Data model, validation, service layer | done |
 | Local CSV backend (flock + compare-and-swap) | done |
 | MCP tools (31), CLI, exports, guarded SQL | done |
-| Google Drive backends (`drive_csv`, `drive_sheets`) | implemented — exercised offline against a fake Drive; **not yet run against a real folder** |
-| Test suite | 105 passing |
+| Google Drive backends (`drive_csv`, `drive_sheets`) | done — verified live: seed, doctor, reads, export, and adversarial cases (browser edits, concurrent writers, deleted files, renamed tabs) |
+| Test suite | 110 passing |
 | Legacy Airtable importer | deferred by design |
 
 Nothing here is shaped around the old spreadsheet. The import is a separate task
@@ -199,12 +199,18 @@ What changes once the files are remote, honestly stated:
   can arrive as locale date strings, `TRUE` arrives as `true`. The store converts
   what it recognises on the way in, and every write is verified by reading back
   what Drive actually stored and re-rendering it — a mismatch raises rather than
-  persisting a silent mutation. Which coercions survive in practice is exactly
-  what the live pass against a real folder is for.
+  persisting a silent mutation. The live pass proved this contract earns its
+  keep: real divergences were caught and aborted instead of landing quietly.
 - **Reads may be up to `cache_ttl_seconds` stale.** Set it to `0` for a
   read-your-writes guarantee at the cost of one API call per table per operation.
-- **Shrinking a table** writes the new rows first and deletes the leftover rows
-  after, so there is no moment where the sheet is empty.
+- **The Sheets read quota is 60 requests/minute/user** and every operation costs
+  read + write + verify. Transient 429s are waited out (≥30 s, so a quota window
+  resets), which makes bulk work like `init --seed` slow-but-fatal-free — a real
+  thousand-row import will want batched writes before it happens.
+- **Shrinking a table** writes the new rows first and clears the leftover rows
+  under them afterwards (`values().clear`; Drive-created spreadsheets report no
+  grid size, so sized row-deletes are not available), so there is no moment
+  where the sheet is empty.
 - Hand-editing a table the server is about to write aborts that write. Editing a
   *different* table while a write is in flight goes unnoticed — CAS covers only
   the tables the commit touches.
@@ -213,7 +219,7 @@ What changes once the files are remote, honestly stated:
 
 | Command | Purpose |
 | --- | --- |
-| `init` | create tables (`--root`, `--seed`, `--backend`, `--drive-folder`, `--actor`) |
+| `init` | create tables (`--root`, `--seed`, `--reset`, `--backend`, `--drive-folder`, `--actor`) |
 | `auth` | Drive consent once (`--manual`, `--port`, `--force`, `--check`) |
 | `serve` | run the MCP server over stdio |
 | `doctor` | integrity report; exit 1 when errors exist (`--json`, `--quiet`) |

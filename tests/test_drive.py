@@ -14,8 +14,6 @@ suite exists to catch.
 
 from __future__ import annotations
 
-import io
-
 import pytest
 
 from inventory_mcp.config import Config
@@ -120,7 +118,9 @@ class _Files:
 
     def get_media(self, fileId):
         entry = self.d.by_id[fileId]
-        return self._guard(lambda: io.BytesIO(entry["content"]))
+        # The real client's execute() returns raw bytes, not a stream -- a fake
+        # that returns BytesIO hides itself from exactly this live bug.
+        return self._guard(lambda: entry["content"])
 
     def create(self, body=None, media_body=None, fields="", **kw):
         data = media_bytes(media_body)
@@ -216,19 +216,36 @@ class _Values:
     def _tab(range_):
         return range_.split("!")[0].strip("'")
 
+    @staticmethod
+    def _start_row(range_):
+        cell = range_.split("!")[1].split(":")[0]
+        digits = "".join(ch for ch in cell if ch.isdigit())
+        return int(digits) if digits else 1
+
     def get(self, spreadsheetId, range="", **kw):
         grid = self.d.by_id[spreadsheetId]["sheet"].tabs.get(self._tab(range), [])
         return FakeRequest(lambda: {"values": grid})
 
     def update(self, spreadsheetId, range="", body=None, **kw):
-        rows = body["values"]
+        rows = [list(r) for r in body["values"]]
         if self.mangle:
             # Stand-in for Sheets deciding a value "means" something else.
             rows = [[str(v).upper() for v in row] for row in rows]
-        self.d.by_id[spreadsheetId]["sheet"].tabs[self._tab(range)] = [
-            list(r) for r in rows
-        ]
+        tab = self.d.by_id[spreadsheetId]["sheet"].tabs[self._tab(range)]
+        # Real Sheets overwrites only the written range; rows below survive --
+        # which is how a stale-row bug survived an early live Drive session.
+        start = self._start_row(range) - 1
+        tab[start:start + len(rows)] = rows
         return FakeRequest(lambda: {"updatedRows": len(rows)})
+
+    def clear(self, spreadsheetId, range="", **kw):
+        tab = self.d.by_id[spreadsheetId]["sheet"].tabs.get(self._tab(range))
+        cleared = 0
+        if tab is not None:
+            start = self._start_row(range) - 1
+            cleared = len(tab) - start
+            del tab[start:]
+        return FakeRequest(lambda: {"clearedRows": cleared})
 
 
 @pytest.fixture
@@ -398,6 +415,21 @@ class TestDriveSheets:
         data = store.read_table("items")
         assert data.header == () and data.rows == ()
 
+    def test_renamed_tab_refuses_to_read_as_empty(self, config, drive):
+        store = sheets_store(config, drive)
+        store.write_table("items", ("item_id",), [{"item_id": "smp_00000001"}], None)
+        # A human renames the tab; the grid survives under its new name.
+        sheet = drive.only()["sheet"]
+        sheet.tabs["items DO NOT TOUCH"] = sheet.tabs.pop("items")
+        with pytest.raises(StoreError, match="none named"):
+            store.read_table("items")
+        # A session holding the old revision cannot write over it either.
+        with pytest.raises(RevisionConflict):
+            store.write_table(
+                "items", ("item_id",), [{"item_id": "smp_00000002"}],
+                compute_revision(("item_id",), [{"item_id": "smp_00000001"}]),
+            )
+
     def test_coerced_content_is_detected_after_write(self, config, drive):
         """If Sheets rewrites what we sent, say so rather than believing our own write."""
         store = sheets_store(config, drive, mangle=True)
@@ -499,6 +531,30 @@ class TestThroughTheService:
         # the hand edit survived the abort
         rows = store.read_table("items").rows
         assert rows[0]["name"] == "renamed by a human"
+
+    def test_partial_commit_rolls_back_tables_already_written(self, drive):
+        """A CAS failure mid-loop must not leave earlier tables half-committed.
+
+        Live finding: with the kits spreadsheet gone, create_supply wrote items
+        first and aborted on kits -- an orphaned items row that then poisoned
+        every later commit. The poison here goes in SAMPLES, the second table
+        create_sample writes, so items lands before the abort.
+        """
+        from inventory_mcp.initdb import init_database
+        from inventory_mcp.service import Conflict
+
+        cfg = Config(backend="drive_sheets", drive_folder_id="FOLDERID", actor="tester",
+                     cache_ttl_seconds=0)
+        store = sheets_store(cfg, drive)
+        svc, _ = init_database(cfg, store=store)
+
+        rev = store.current_revision("samples")
+        store.write_table("samples", ("sample_id",), [{"sample_id": "smp_poison00"}], rev)
+        with pytest.raises(Conflict, match="Reverted: items"):
+            svc.create_sample("Half-written ghost", "dna")
+        rows = store.read_table("items").rows
+        assert all(r.get("name") != "Half-written ghost" for r in rows), \
+            "aborted commit left an items row behind"
 
 
 class TestFolderResolution:
