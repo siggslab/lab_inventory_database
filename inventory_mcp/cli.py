@@ -52,6 +52,10 @@ def _build_parser() -> argparse.ArgumentParser:
     init.add_argument("--root", help="directory for tables/ exports/ backups/")
     init.add_argument("--drive-folder", help="Drive folder id or URL")
     init.add_argument("--seed", action="store_true", help="fill with development fixture data")
+    init.add_argument("--reset", action="store_true",
+                      help="discard all existing rows first (for re-seeding a test "
+                           "database after an interrupted run; on Drive, version "
+                           "history is the only undo)")
     init.add_argument("--actor", default="", help="identity recorded in updated_by")
     init.set_defaults(func=_cmd_init)
 
@@ -123,19 +127,44 @@ def _load_config(args) -> Config:
 def _cmd_init(args) -> int:
     from .initdb import init_database
 
+    # Start from the existing config so credential paths survive; override what
+    # the user asked for on the command line.
+    base = None
+    if args.config:
+        try:
+            base = Config.load(args.config)
+        except ConfigError:
+            pass
+
     if args.backend == "local":
         if not args.root:
             print("init: --root is required for a local database", file=sys.stderr)
             return 2
         root = Path(args.root).expanduser()
-        cfg = Config(backend="local", local_root=str(root), actor=args.actor)
+        cfg = Config(
+            backend="local", local_root=str(root), actor=args.actor,
+            token_path=getattr(base, "token_path", ""),
+            client_secret_path=getattr(base, "client_secret_path", ""),
+            service_account_path=getattr(base, "service_account_path", ""),
+        )
     else:
         if not args.drive_folder:
             print("init: --drive-folder is required for a Drive backend", file=sys.stderr)
             return 2
-        cfg = Config(backend=args.backend, drive_folder_id=args.drive_folder, actor=args.actor)
+        cfg = Config(
+            backend=args.backend, drive_folder_id=args.drive_folder, actor=args.actor,
+            token_path=getattr(base, "token_path", ""),
+            client_secret_path=getattr(base, "client_secret_path", ""),
+            service_account_path=getattr(base, "service_account_path", ""),
+        )
 
     svc, created = init_database(cfg)
+    wiped = ""
+    if args.reset:
+        from .seed import reset
+
+        removed = reset(svc)
+        wiped = ", ".join(f"{k}={v}" for k, v in removed.items()) or "(nothing to discard)"
     seeded = ""
     if args.seed:
         from .seed import seed
@@ -148,6 +177,8 @@ def _cmd_init(args) -> int:
     print(f"config written   {cfg_path}")
     print(f"backend          {cfg.backend}")
     print(f"tables created   {', '.join(created) if created else '(all present)'}")
+    if wiped:
+        print(f"rows discarded   {wiped}")
     if seeded:
         print(f"seeded           {seeded}")
     print(f"integrity        {'clean' if report['ok'] else str(report['error_count']) + ' error(s)'}")

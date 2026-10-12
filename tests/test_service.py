@@ -289,3 +289,52 @@ class TestQueryGuard:
             "select name, container_label, position from items_wide where class='sample'"
         )
         assert any(r["container_label"] for r in out["rows"])
+
+
+class TestReset:
+    """`init --reset --seed` recovery path: truncate, then seed from clean."""
+
+    def test_reset_empties_tables_and_allows_reseed(self, config):
+        from inventory_mcp import schema
+        from inventory_mcp.initdb import init_database
+        from inventory_mcp.seed import reset, seed
+
+        service, _ = init_database(config)
+        seed(service)
+        removed = reset(service)
+        assert removed["samples"] == 10
+        assert sum(len(service.db.t(t.name).rows) for t in schema.TABLES) == 0
+        # the duplicate guard that motivated reset() no longer trips
+        counts = seed(service)
+        assert counts["samples"] == 10
+
+    def test_reset_keeps_columns_someone_added_by_hand(self, seeded):
+        from inventory_mcp.seed import reset
+
+        t = seeded.db.t("assays")
+        header = t.header + ("lab_note",)
+        rows = [dict(r, lab_note="kept") for r in t.rows]
+        seeded.store.write_table("assays", header, rows, t.revision or None)
+        seeded.reload()
+        reset(seeded)
+        first_line = table_path(seeded.local_root(), "assays").read_text().splitlines()[0]
+        assert "lab_note" in first_line.split(",")
+        assert read_rows(table_path(seeded.local_root(), "assays")) == []
+
+
+class TestCommitAtomicity:
+    """Multi-table commits that abort mid-way must leave nothing half-landed."""
+
+    def test_aborted_commit_rolls_back_the_table_already_written(self, svc):
+        from inventory_mcp.service import Conflict
+
+        _ = svc.db.t("samples").revision  # eager load, like a session at work
+        rev = svc.store.current_revision("samples")
+        # External change to the *second* table create_sample writes: items
+        # lands first, samples then fails CAS -- without rollback the items
+        # row survives as an orphan (live Drive finding).
+        svc.store.write_table("samples", ("sample_id",), [], rev)
+        with pytest.raises(Conflict, match="Reverted: items"):
+            svc.create_sample("Half-written ghost", "dna")
+        fresh = read_rows(table_path(svc.local_root(), "items"))
+        assert all(r["name"] != "Half-written ghost" for r in fresh)

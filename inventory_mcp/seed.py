@@ -194,6 +194,26 @@ def seed(svc: Service) -> dict:
     return {t.name: len(svc.db.t(t.name).rows) for t in schema.TABLES}
 
 
+def reset(svc: Service) -> dict:
+    """Discard every row from every table, keeping the files (and their
+    hand-added columns) in place.
+
+    A Drive session cut off by the Sheets quota can leave half a seed behind,
+    and re-seeding then trips the duplicate guards. This is the recovery path
+    rather than deleting files: truncate and start over. On Drive the version
+    history is the only undo, so this belongs on a test database, not prod.
+    """
+    removed: dict[str, int] = {}
+    for spec in schema.TABLES:
+        t = svc.db.t(spec.name)
+        if t.missing or not t.rows:
+            continue
+        svc.store.write_table(spec.name, t.header, [], t.revision or None)
+        removed[spec.name] = len(t.rows)
+    svc.reload()
+    return removed
+
+
 def _id(records):
     if not records:
         raise RuntimeError("expected a record back from the service")
