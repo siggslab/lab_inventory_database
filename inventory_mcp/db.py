@@ -96,13 +96,20 @@ class Database:
         return list(reversed(out))
 
     def capacity_of(self, container_id: str) -> Optional[int]:
+        """How many things fit here, or None when nobody recorded it.
+
+        A slot holds one thing, which may be a tube or a nested container, so the
+        number is unitless on purpose. Never add capacities of containers that sit
+        at different tiers: five box-slots and a hundred wells are not two hundred
+        of anything.
+        """
         by_id = self.containers_by_id()
         c = by_id.get(container_id)
         if not c:
             return None
-        override = _to_int(c.get("capacity_override", ""))
-        if override is not None:
-            return override
+        stated = _to_int(c.get("capacity", ""))
+        if stated is not None:
+            return stated
         rows = _to_int(c.get("rows", ""))
         cols = _to_int(c.get("cols", ""))
         if rows and cols:
@@ -115,6 +122,17 @@ class Database:
             for r in self.t("items").live()
             if r.get("location_id", "").strip() == container_id
         ]
+
+    def child_containers(self, container_id: str) -> list[str]:
+        return [
+            cid
+            for cid, c in self.containers_by_id().items()
+            if (c.get("parent_id", "") or "").strip() == container_id
+        ]
+
+    def slot_use(self, container_id: str) -> int:
+        """Slots taken here: every resident item and every nested container."""
+        return len(self.occupants(container_id)) + len(self.child_containers(container_id))
 
 
 def empty_table(name: str) -> Table:

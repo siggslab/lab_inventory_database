@@ -28,7 +28,7 @@ EXPORT_VIEWS = (
     "items_wide",
     "occupancy",
     "measurements_long",
-    "lineage",
+    "item_links",
     "patient_projects",
 )
 
@@ -44,9 +44,9 @@ def export_views(service, directory: str = "", formats=("csv", "sqlite")) -> dic
 
     views = {
         "items_wide": _view_items_wide(service),
-        "occupancy": service.occupancy(),
+        "occupancy": service._occupancy_rows(),
         "measurements_long": _view_measurements(service),
-        "lineage": _view_lineage(service),
+        "item_links": _view_item_links(service),
         "patient_projects": _view_patient_projects(service),
     }
 
@@ -107,7 +107,7 @@ def _view_items_wide(service) -> list[dict]:
     ext = service._extension_index()
     latest = {
         (m["item_id"], m["assay"]): m
-        for m in service.get_measurements(latest_only=True)
+        for m in service._measurement_rows()
     }
     # group latest measurements per item for compact columns
     per_item: dict[str, dict[str, dict]] = {}
@@ -162,7 +162,8 @@ def _view_items_wide(service) -> list[dict]:
 
 def _view_measurements(service) -> list[dict]:
     rows = []
-    for m in service.get_measurements(include_superseded=True):
+    # Both flags: this view is the complete record, not what is currently believed.
+    for m in service._measurement_rows(include_historical=True, include_superseded=True):
         canon = m.get("canonical") or {}
         rows.append(
             {
@@ -186,11 +187,11 @@ def _view_measurements(service) -> list[dict]:
     return rows
 
 
-def _view_lineage(service) -> list[dict]:
+def _view_item_links(service) -> list[dict]:
     db = service.db
     items = db.items_by_id()
     rows = []
-    for r in db.t("item_parents").rows:
+    for r in db.t("item_links").rows:
         child = items.get((r.get("child_item_id", "") or "").strip(), {})
         parent = items.get((r.get("parent_item_id", "") or "").strip(), {})
         rows.append(
@@ -261,7 +262,7 @@ def _write_sqlite(path: Path, db, views: dict[str, list[dict]]) -> None:
             if name in db.tables:
                 # A real table is already loaded under that name; re-creating it
                 # from a denormalised copy would shadow the source of truth.
-                # patient_projects gains its labels as a SQL view instead.
+                # item_links and patient_projects gain labelled SQL views instead.
                 continue
             _load_view(conn, name, rows)
         conn.executescript(
@@ -271,6 +272,13 @@ def _write_sqlite(path: Path, db, views: dict[str, list[dict]]) -> None:
             FROM patient_projects l
             LEFT JOIN patients p ON p.patient_id = l.patient_id
             LEFT JOIN projects pr ON pr.project_id = l.project_id;
+
+            CREATE VIEW IF NOT EXISTS item_links_named AS
+            SELECT l.*, c.name AS child_name, c.class AS child_class,
+                   p.name AS parent_name, p.class AS parent_class
+            FROM item_links l
+            LEFT JOIN items c ON c.item_id = l.child_item_id
+            LEFT JOIN items p ON p.item_id = l.parent_item_id;
             """
         )
         conn.commit()

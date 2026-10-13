@@ -1,4 +1,4 @@
-# Status — 2026-10-12
+# Status — 2026-10-13
 
 Working notes for whoever picks this up next. The user-facing description lives in
 [README.md](README.md); this file records state, decisions and open questions.
@@ -21,13 +21,15 @@ would have bent the schema for the wrong reason.
 ## Verified right now
 
 ```
-.venv/bin/python -m pytest -q          # 110 passed
+.venv/bin/python -m pytest -q          # 165 passed
 inventory-mcp doctor                   # 0 error(s), 0 warning(s) -> OK   (on .devdb)
 inventory-mcp tools                    # 31 tools, real parameter schemas
 inventory-mcp init --seed              # items=13 samples=10 measurements=18, integrity clean
 inventory-mcp init --reset --seed      # truncate all tables first, then seed (recovery path)
 inventory-mcp export                   # items_wide, occupancy, measurements_long,
-                                       # lineage, patient_projects, inventory.sqlite
+                                       # item_links, patient_projects, inventory.sqlite
+inventory-mcp occupancy                # every tier in its own unit: freezer 1/4 shelf
+                                       # positions, Rack 3 2/6 box positions, box 2/81 wells
 ```
 
 Live against Drive (config at `.devdb/drive.config.json`, backend `drive_sheets`):
@@ -101,7 +103,7 @@ rerunnable; they pre-clean their own litter).
 | `inventory_mcp/service.py` | every mutation, all through one `_apply` commit path (now with rollback) |
 | `inventory_mcp/store/` | `base` (revisions, `TableStore`), `local`, `drive` |
 | `inventory_mcp/auth.py` | installed-app OAuth flow, manual relay, service-account precedence |
-| `inventory_mcp/tools.py` | the 31 MCP tools |
+| `inventory_mcp/tools.py` | the 32 MCP tools |
 | `inventory_mcp/query.py` | guarded read-only SQL over an in-memory SQLite mirror |
 | `inventory_mcp/exports.py` | denormalised views + SQLite mirror + manifest |
 | `inventory_mcp/seed.py` | development fixture, built by calling the service; `reset()` truncates |
@@ -135,6 +137,48 @@ rerunnable; they pre-clean their own litter).
 - Bulk-operation quota strategy: per-row read+write+verify will not survive a
   thousand-row import at 60 reads/min. Batching (multi-table value updates,
   skip-verify behind a flag) is the obvious shape; needed before real data lands.
+- `assays.canonical_unit` is `required=True` unconditionally (`schema.py`), so a
+  **textual** assay cannot be registered without inventing a placeholder unit —
+  "gel smear quality" has none. Found while pinning the text-assay path in
+  `TestGetItem`; the test passes `"score"` and says so. Fix is to make the
+  requirement conditional on `result_type == "numeric"` (column-level `required`
+  can express that, so the rule moves into `_validate_assays`). No textual assay
+  exists in the seed today, which is why this stayed hidden.
+- Schema v2 renamed `item_parents` → `item_links`, `link_parent` → `link_items`, the
+  `lineage` export view → `item_links`, and the doctor codes `self_lineage` /
+  `lineage_cycle` → `self_link` / `derivation_cycle`. Local `.devdb` was migrated by
+  renaming its CSV (4 edges intact). **The Drive folder still holds `item_parents`**:
+  rename the file — or the sheet tab, under `drive_sheets` — before pointing a
+  Drive-backed config at this build, or the edges read as empty and `init` quietly
+  creates a second, empty table beside the old one.
+- Two read tools left the surface during the same pass. **`rollup_by_container` is
+  deleted**: grouping items by their direct container can only ever produce leaf boxes,
+  so it could not answer anything about a freezer, and `get_occupancy`, `list_containers`
+  and `run_query` cover what it said. `_rollup` now serves the project axis alone.
+  **`rollup_by_patient` became `search_patients`**, because the census shape had two
+  faults: `(none)` mixed "not a sample" with "sample with no participant", and cost grew
+  with the cohort. It now requires a `query` matched against participant ids and labels,
+  enumerates from the participants table (so an enrolled person with no tubes returns
+  `total: 0` rather than vanishing), caps rows at `limit` (default 20) reporting
+  `matched`/`truncated`, and carries `unassigned` — samples held with no participant —
+  beside the rows instead of as a fake row that would compete with the limit. No blank
+  query is accepted; `"pat_"` matches every id, which is the only way to ask for the
+  whole cohort. If that census should be first-class, give `query` a wildcard value.
+- Schema v3 made capacity a property of every container, not just gridded ones:
+  `containers.capacity_override` → `capacity`, meaning **slots** — one tube in a well
+  or one box in a rack, never both summed together. `occupied` now counts nested
+  containers (`occupancy.csv` gained `items_held` and `has_capacity`, lost `grid`,
+  `with_known_well` and `wells_resolved` — positions are convenience data, so no
+  occupancy figure is computed from them any more),
+  `get_occupancy` reports the tier the rows live in so a freezer answers "1 of 4 shelf
+  positions used" and Rack 3 answers "2 of 6 box positions", and doctor added
+  `grid_on_furniture` (a well grid on a non-box kind) plus `bad_capacity` and
+  `capacity_disagrees_with_grid`. The seed sets slot counts on the freezer, shelf,
+  racks and LN2 shipper; fridge and bench stay unmeasured so the null path survives.
+  **A pre-v3 `containers` sheet reads with two warnings** (`column_missing` for
+  `capacity`, `unknown_column` for `capacity_override`) and every furniture tier
+  reports `capacity: null` until the header is renamed there — verified against a
+  copy of `.devdb` with the old header, so it degrades rather than lying.
 
 ## Deferred by agreement
 

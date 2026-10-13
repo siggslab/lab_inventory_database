@@ -90,7 +90,6 @@ class ItemFilter:
     project_id: str = ""
     patient_id: str = ""
     container_id: str = ""
-    container_subtree: bool = False
     sample_type: str = ""
     gml_id: str = ""
     unlocated: bool = False
@@ -183,16 +182,20 @@ class Service:
         return self._merged_item(row)
 
     def search_items(self, **kwargs) -> list[dict]:
+        return [self._lean_row(r) for r in self._matching_items(**kwargs)]
+
+    def _matching_items(self, **kwargs) -> list[dict]:
+        """Filtered items as complete summary records.
+
+        The untrimmed sibling of ``search_items``: same filters, no context
+        diet. Internal consumers (rollups, CLI) read it so that the model-facing
+        rows can stay as thin as they want.
+        """
         f = ItemFilter(**kwargs)
         db = self.db
         items = db.items_by_id()
         ext_index = self._extension_index()
         containers = db.containers_by_id()
-        subtree = (
-            self._container_subtree(f.container_id)
-            if (f.container_subtree and f.container_id)
-            else None
-        )
         needle = f.text.lower().strip()
         out: list[dict] = []
         for iid, row in items.items():
@@ -206,12 +209,8 @@ class Service:
             loc = (row.get("location_id", "") or "").strip()
             if f.unlocated and loc:
                 continue
-            if f.container_id:
-                if subtree is not None:
-                    if loc not in subtree:
-                        continue
-                elif loc != f.container_id:
-                    continue
+            if f.container_id and loc != f.container_id:
+                continue
             if f.has_position is not None:
                 has = bool((row.get("position", "") or "").strip())
                 if has != f.has_position:
@@ -244,6 +243,30 @@ class Service:
             out.append(self._merged_item(row, summary=True))
         out.sort(key=lambda r: r["name"].lower())
         return out
+
+    # A search hit answers "is this the one I mean?"; everything else is
+    # get_item's job. Ids of related objects are omitted too: wanting them is
+    # a decision to look at that object, not a thing to stumble into.
+    _LEAN_OMIT = ("class", "handler", "notes", "updated_by")
+    _LEAN_OMIT_LOCATION = ("container_id", "position")
+    _LEAN_OMIT_SAMPLE = ("source_material", "patient_id", "project_id",
+                         "collected_on", "received_on", "processed_on")
+
+    @staticmethod
+    def _lean_row(item: dict) -> dict:
+        if item.pop("deleted_at", ""):
+            item["deleted"] = True
+        for key in Service._LEAN_OMIT:
+            item.pop(key, None)
+        for block, keys in (
+            ("location", Service._LEAN_OMIT_LOCATION),
+            ("sample", Service._LEAN_OMIT_SAMPLE),
+        ):
+            sub = item.get(block)
+            if sub:
+                for key in keys:
+                    sub.pop(key, None)
+        return item
 
     def list_containers(self, kind: str = "", parent_id: str = "") -> list[dict]:
         db = self.db
@@ -282,77 +305,362 @@ class Service:
             return [build(root_id)]
         return [build(c) for c in roots]
 
-    def occupancy(self, container_id: str = "", recursive: bool = False) -> list[dict]:
+    def get_occupancy(self, container_id: str, kind: str = "") -> dict:
+        """How full one container is, reported at the granularity ``kind`` names.
+
+        ``rows`` are the things of that kind inside the target: the containers
+        directly nested in it when ``kind`` is empty, every container of that kind
+        further down, or the items it holds when ``kind`` names an item class. The
+        target itself counts as a row when its own kind matches, so asking about a
+        box in units of boxes reports the box. Each row carries its own figures.
+
+        ``summary`` measures the containers the rows live in, which is what keeps
+        the numbers in the same unit as the question: ask about samples and you get
+        well grids, ask about boxes and you get the slots their racks offer. Ask a
+        container about its own kind and it measures itself instead, so a box queried
+        in units of boxes says how full that box is. Nothing is added across tiers --
+        five box slots and a hundred wells are not two hundred of anything. ``holds``
+        says what fills the measured slots, since a fill figure that could mean tubes
+        or boxes is not an answer. ``occupied`` counts every slot taken in that tier,
+        including a box squatting on a bench where you hoped to put a tube, so it can
+        exceed the number of rows when the filter leaves something out. Nothing here is
+        computed from well positions: they are optional per item and inconsistently
+        recorded, so an item row repeats its position where one exists and no figure
+        depends on whether anyone filled it in.
+        """
+        if not container_id.strip():
+            raise ServiceError("container_id is required; this reports on one container")
+        cid = container_id.strip()
         db = self.db
-        targets = (
-            sorted(self._container_subtree(container_id))
-            if (recursive and container_id)
-            else [container_id]
-            if container_id
-            else sorted(db.containers_by_id())
-        )
         by_id = db.containers_by_id()
+        if cid not in by_id:
+            raise NotFound(f"no container with id {cid!r}")
+        level = kind.strip()
+        if level and level not in schema.CONTAINER_KINDS and level not in schema.ITEM_CLASSES:
+            raise ServiceError(
+                f"kind {level!r} is neither a container kind "
+                f"({' '.join(schema.CONTAINER_KINDS)}) nor an item class "
+                f"({' '.join(schema.ITEM_CLASSES)})"
+            )
+
+        nested = self._container_subtree(cid)
+        report = {
+            "target": {
+                "container_id": cid,
+                "label": by_id[cid].get("label", ""),
+                "kind": by_id[cid].get("kind", ""),
+            },
+            "kind": level or "children",
+            "summary": {},
+            "rows": [],
+        }
+
+        if not level or level in schema.CONTAINER_KINDS:
+            if level:
+                # The target matches its own kind, so asking about a box in units
+                # of boxes reports the box rather than an empty list.
+                found = [c for c in nested if by_id[c].get("kind", "") == level]
+            else:
+                found = [
+                    c for c in nested
+                    if (by_id[c].get("parent_id", "") or "").strip() == cid
+                ]
+            rows = []
+            for c in sorted(found, key=lambda c: " / ".join(db.container_path(c))):
+                cap = db.capacity_of(c)
+                used = db.slot_use(c)
+                rows.append(
+                    {
+                        "container_id": c,
+                        "label": by_id[c].get("label", ""),
+                        "kind": by_id[c].get("kind", ""),
+                        "capacity": cap,
+                        "occupied": used,
+                        "free": (cap - used) if cap is not None else None,
+                    }
+                )
+            report["rows"] = rows
+            # The tier measured is where the rows live -- but asking a container about
+            # its own level is a question about that container, so it answers for
+            # itself rather than for the shelf or rack it happens to stand on.
+            homes = {cid} if cid in found else {
+                (by_id[c].get("parent_id", "") or "").strip() for c in found
+            } - {""}
+            report["summary"] = self._tier_stats(homes)
+            return report
+
+        holders: set[str] = set()
+        rows = []
+        matches = [
+            r for r in db.t("items").live()
+            if (r.get("location_id", "") or "").strip() in nested
+            and r.get("class", "") == level
+        ]
+        for r in sorted(
+            matches,
+            key=lambda r: (
+                " / ".join(db.container_path((r.get("location_id", "") or "").strip())),
+                (r.get("position", "") or "").strip(),
+                r.get("name", "").lower(),
+                r["item_id"],
+            ),
+        ):
+            loc = (r.get("location_id", "") or "").strip()
+            holders.add(loc)
+            rows.append(
+                {
+                    "item_id": r["item_id"].strip(),
+                    "class": r.get("class", ""),
+                    "name": r.get("name", ""),
+                    "status": r.get("status", ""),
+                    "position": (r.get("position", "") or "").strip(),
+                    "in": " / ".join(db.container_path(loc)) if loc else "",
+                }
+            )
+        report["rows"] = rows
+        report["summary"] = self._tier_stats(holders)
+        return report
+
+    def _tier_stats(self, containers: set[str]) -> dict:
+        """Capacity and fill for exactly these containers -- nothing below them.
+
+        Only containers holding the same kind of thing are ever summed, which is what
+        keeps ``capacity`` and ``occupied`` the same unit. Capacity stays ``None``
+        when none of them has one recorded: "not measurable" and "measurable and
+        empty" are different answers, and collapsing them would make an unlabelled
+        rack look identical to a full one. Well positions are deliberately absent --
+        they are optional per item and inconsistent in practice, so occupancy counts
+        slots and leaves the grid to whoever has it recorded.
+        """
+        db = self.db
+        measured = False
+        capacity = occupied = items = nested = 0
+        for cid in containers:
+            cap = db.capacity_of(cid)
+            if cap is not None:
+                measured = True
+                capacity += cap
+            occupants = db.occupants(cid)
+            kids = db.child_containers(cid)
+            items += len(occupants)
+            nested += len(kids)
+            occupied += len(occupants) + len(kids)
+        holds = "" if not containers else (
+            "items" if not nested else ("containers" if not items else "mixed")
+        )
+        return {
+            "holds": holds,
+            "capacity": capacity if measured else None,
+            "occupied": occupied,
+            "free": (capacity - occupied) if measured else None,
+        }
+
+    def _occupancy_rows(self, container_id: str = "", kind: str = "") -> list[dict]:
+        """Each container's own numbers, untrimmed -- what exports and the CLI read.
+
+        Flat and unrolled by design: a row means "this container, its own slots",
+        carrying the path and the derived figures that the MCP answer leaves for the
+        caller to compute. ``occupied`` counts every slot taken, nested containers
+        included, so a rack full of boxes reads full rather than empty. No well
+        columns: positions are optional per item, and a fill rate over a grid nobody
+        records consistently is a number no dashboard can act on.
+        """
+        db = self.db
+        by_id = db.containers_by_id()
+        targets = sorted(
+            self._container_subtree(container_id) if container_id else by_id
+        )
         out = []
         for cid in targets:
             if cid not in by_id:
                 raise NotFound(f"no container with id {cid!r}")
+            if kind and by_id[cid].get("kind", "") != kind:
+                continue
             occupants = db.occupants(cid)
             cap = db.capacity_of(cid)
-            positioned = sum(1 for o in occupants if (o.get("position", "") or "").strip())
             children = [
                 c for c in by_id.values() if (c.get("parent_id", "") or "").strip() == cid
             ]
-            row = {
-                "container_id": cid,
-                "label": by_id[cid].get("label", ""),
-                "kind": by_id[cid].get("kind", ""),
-                "path": " / ".join(db.container_path(cid)),
-                "capacity": cap,
-                "occupied": len(occupants),
-                "child_containers": len(children),
-                "free": (cap - len(occupants)) if cap is not None else None,
-                "occupancy_pct": (
-                    round(100.0 * len(occupants) / cap, 1) if cap else None
-                ),
-                "with_known_well": positioned,
-                # A container with no grid has no wells to resolve, so it is
-                # vacuously resolved -- otherwise every freezer reads as
-                # "incomplete" and the flag stops meaning anything.
-                "wells_resolved": cap is None or positioned == len(occupants),
-                "grid": cap is not None,
-            }
-            out.append(row)
+            used = len(occupants) + len(children)
+            out.append(
+                {
+                    "container_id": cid,
+                    "label": by_id[cid].get("label", ""),
+                    "kind": by_id[cid].get("kind", ""),
+                    "path": " / ".join(db.container_path(cid)),
+                    "capacity": cap,
+                    "occupied": used,
+                    "items_held": len(occupants),
+                    "child_containers": len(children),
+                    "free": (cap - used) if cap is not None else None,
+                    "occupancy_pct": (round(100.0 * used / cap, 1) if cap else None),
+                    "has_capacity": cap is not None,
+                }
+            )
+        out.sort(key=lambda r: r["path"])
         return out
+
+    def contents(self, container_id: str, recursive: bool = False) -> dict:
+        """What is stored in a container: lean rows, plus room at the top."""
+        db = self.db
+        by_id = db.containers_by_id()
+        if container_id not in by_id:
+            raise NotFound(f"no container with id {container_id!r}")
+        targets = self._container_subtree(container_id) if recursive else {container_id}
+        row = by_id[container_id]
+        occupants = [
+            i for i in db.items_by_id().values()
+            if (i.get("location_id", "") or "").strip() in targets
+            and not (i.get("deleted_at", "") or "").strip()
+        ]
+        cap = db.capacity_of(container_id)
+        kids = db.child_containers(container_id)
+        here = len(db.occupants(container_id))
+        return {
+            "container": {
+                "container_id": container_id,
+                "kind": row.get("kind", ""),
+                "label": row.get("label", ""),
+                "path": " / ".join(db.container_path(container_id)),
+                "geometry": self._geometry(row),
+                "capacity": cap,
+                "occupied_here": here,
+                # Nested containers take slots too, so free is not capacity minus the
+                # items listed below -- otherwise a bench reports room that isn't there.
+                "child_containers": len(kids),
+                "free": (cap - here - len(kids)) if cap is not None else None,
+            },
+            "recursive": recursive,
+            "count": len(occupants),
+            "items": [
+                self._contents_row(i, db, container_id, recursive)
+                for i in sorted(
+                    occupants,
+                    key=lambda i: (
+                        i.get("position", ""), i.get("name", "").lower(), i["item_id"]
+                    ),
+                )
+            ],
+        }
+
+    def _contents_row(self, item: dict, db, top: str, recursive: bool) -> dict:
+        row = {
+            "item_id": item["item_id"],
+            "class": item.get("class", ""),
+            "name": item.get("name", ""),
+            "status": item.get("status", ""),
+            "position": (item.get("position", "") or "").strip(),
+        }
+        if recursive:
+            loc = (item.get("location_id", "") or "").strip()
+            row["in"] = (
+                " / ".join(db.container_path(loc)) if loc != top else ""
+            )
+        return row
 
     def count_items(self, **kwargs) -> int:
         return len(self.search_items(**kwargs))
 
-    def rollup_by_patient(self, **kwargs) -> list[dict]:
-        return self._rollup("patient", **kwargs)
+    def search_patients(self, query: str, project_id: str = "", limit: int = 20) -> dict:
+        """Participants whose id or label matches ``query``, each with sample counts.
+
+        Matching runs against the participants table, not the samples, so an enrolled
+        participant with nothing stored still comes back under ``total: 0`` -- which is
+        the difference between "not enrolled yet" and "no such person". Only samples
+        carry a participant, so supplies are never counted here; ``project_id`` narrows
+        what is counted without narrowing who is listed. Rows come back heaviest first
+        and stop at ``limit``, with ``matched`` and
+        ``truncated`` reported rather than leaving the caller to infer it from a
+        suspiciously round row count. There is no blank query; every id starts with
+        ``pat_``, so that string serves as match-all.
+
+        ``unassigned`` sits beside the rows rather than among them: how many samples the
+        filters matched with no participant recorded. It is a caveat about the cohort,
+        not a search result, so it neither occupies a row nor competes with the limit.
+        """
+        needle = query.strip().lower()
+        if not needle:
+            raise ServiceError(
+                "query is required; match on a participant id or part of a label"
+            )
+        try:
+            cap = max(1, int(limit))
+        except (TypeError, ValueError):
+            cap = 20
+        db = self.db
+        matched = [
+            p for p in db.t("patients").live()
+            if needle in p.get("patient_id", "").lower()
+            or needle in p.get("label", "").lower()
+        ]
+        empty = {"total": 0, "present": 0, "partially_consumed": 0, "consumed": 0}
+        counts: dict[str, dict] = {}
+        unassigned = dict(empty)
+        for it in self._matching_items(item_class="sample", project_id=project_id):
+            pid = (it.get("sample") or {}).get("patient_id", "")
+            bucket = counts.setdefault(pid, dict(empty)) if pid else unassigned
+            bucket["total"] += 1
+            if it.get("status", "") in bucket:
+                bucket[it["status"]] += 1
+
+        def by_volume(p: dict) -> tuple:
+            return (-counts.get(p["patient_id"], empty)["total"],
+                    p.get("label", "").lower())
+
+        people = [
+            {"key": p["patient_id"], "label": p.get("label", ""),
+             **counts.get(p["patient_id"], empty)}
+            for p in sorted(matched, key=by_volume)
+        ]
+        return {
+            "matched": len(people),
+            "truncated": len(people) > cap,
+            "unassigned": unassigned["total"],
+            "rows": people[:cap],
+        }
 
     def rollup_by_project(self, **kwargs) -> list[dict]:
         return self._rollup("project", **kwargs)
 
-    def rollup_by_container(self, **kwargs) -> list[dict]:
-        return self._rollup("container", **kwargs)
+    def get_measurements(self, **kwargs) -> list[dict]:
+        """Filtered readings, trimmed for a context window. See ``_measurement_rows``."""
+        return [self._tool_reading(r) for r in self._measurement_rows(**kwargs)]
 
-    def get_measurements(
+    def _measurement_rows(
         self,
         item_id: str = "",
-        assay_code: str = "",
-        latest_only: bool = False,
+        assay: str = "",
+        include_historical: bool = False,
         include_superseded: bool = False,
     ) -> list[dict]:
+        """Readings as currently believed: newest per item and assay.
+
+        The untrimmed sibling of ``get_measurements``: same filters, every column.
+        Exports read it so the model-facing rows can stay as thin as they want.
+
+        Two independent axes of extra rows, both off by default.
+        ``include_superseded`` adds readings a correction invalidated; those are
+        never candidates for "the latest", so they arrive on top of whatever the
+        other flags chose. ``include_historical`` adds valid readings that a newer
+        one has overtaken -- the whole series instead of its endpoint.
+
+        An empty ``item_id`` means every item, which is what the exports iterate.
+        The MCP tool requires one; this layer does not.
+        """
         db = self.db
         assays = db.assays_by_id()
-        code_to_id = {a.get("code", ""): aid for aid, a in assays.items()}
-        wanted_assay = code_to_id.get(assay_code) if assay_code else None
+        # A mistyped code must not fall through as "no filter wanted": returning
+        # every reading looks reassuringly like a query that worked.
+        wanted_assay = self._assay_id_for_code(assay)
+        if item_id:
+            self._require_item(item_id)
         superseded = {
             (r.get("supersedes", "") or "").strip()
             for r in db.t("measurements").rows
             if (r.get("supersedes", "") or "").strip()
         }
         rows = []
+        retired = []
         for r in db.t("measurements").rows:
             mid = (r.get("measurement_id", "") or "").strip()
             if not mid:
@@ -362,10 +670,8 @@ class Service:
             assay_id = (r.get("assay_id", "") or "").strip()
             if wanted_assay and assay_id != wanted_assay:
                 continue
-            if not include_superseded and mid in superseded:
-                continue
-            assay = assays.get(assay_id, {})
-            quantity = assay.get("quantity", "other")
+            meta = assays.get(assay_id, {})
+            quantity = meta.get("quantity", "other")
             unit = (r.get("unit", "") or "").strip()
             num_raw = (r.get("value_num", "") or "").strip()
             canonical = None
@@ -375,36 +681,72 @@ class Service:
                     canonical = {"value": value, "unit": canon_unit}
                 except units.UnitError:
                     canonical = None
-            rows.append(
-                {
-                    "measurement_id": mid,
-                    "item_id": (r.get("item_id", "") or "").strip(),
-                    "assay": assay.get("code", assay_id),
-                    "assay_name": assay.get("name", ""),
-                    "quantity": quantity,
-                    "measured_on": r.get("measured_on", ""),
-                    "value_num": _opt_float(num_raw),
-                    "value_text": r.get("value_text", ""),
-                    "unit": unit,
-                    "canonical": canonical,
-                    "handler": r.get("handler", ""),
-                    "instrument": r.get("instrument", ""),
-                    "supersedes": r.get("supersedes", ""),
-                    "superseded": mid in superseded,
-                    "notes": r.get("notes", ""),
-                }
-            )
-        rows.sort(key=lambda x: (x["item_id"], x["assay"], x["measured_on"]))
-        if latest_only:
+            row = {
+                "measurement_id": mid,
+                "item_id": (r.get("item_id", "") or "").strip(),
+                "assay": meta.get("code", assay_id),
+                "assay_name": meta.get("name", ""),
+                "quantity": quantity,
+                "measured_on": r.get("measured_on", ""),
+                "value_num": _opt_float(num_raw),
+                "value_text": r.get("value_text", ""),
+                "unit": unit,
+                "canonical": canonical,
+                "handler": r.get("handler", ""),
+                "instrument": r.get("instrument", ""),
+                "supersedes": r.get("supersedes", ""),
+                "superseded": mid in superseded,
+                "notes": r.get("notes", ""),
+            }
+            if mid in superseded:
+                retired.append(row)
+            else:
+                rows.append(row)
+        if not include_historical:
             latest: dict[tuple[str, str], dict] = {}
             for r in rows:
                 latest[(r["item_id"], r["assay"])] = r
             rows = list(latest.values())
+        if include_superseded:
+            rows.extend(retired)
+        rows.sort(key=lambda x: (x["item_id"], x["assay"], x["measured_on"]))
         return rows
 
-    def lineage(self, item_id: str, direction: str = "both", depth: int = 5) -> dict:
+    # A reading answers what was measured, when, and whether it is still the
+    # belief. The assay code already keys the registry, so quantity is one lookup
+    # away; the row echoes no item_id because a reading query names its item.
+    # Canonical conversion stays in the exports, where the arithmetic belongs --
+    # value+unit here is the number as observed, which is what prose quotes back.
+    @staticmethod
+    def _tool_reading(m: dict) -> dict:
+        return {
+            "measurement_id": m["measurement_id"],
+            "assay": m["assay"],
+            "assay_name": m["assay_name"],
+            "measured_on": m["measured_on"],
+            "value": m["value_num"] if m["value_num"] is not None else m["value_text"],
+            "unit": m["unit"],
+            "handler": m["handler"],
+            "instrument": m["instrument"],
+            "supersedes": m["supersedes"],
+            "superseded": m["superseded"],
+            "notes": m["notes"],
+        }
+
+    def get_linked_items(self, item_id: str, direction: str = "both", depth: int = 1) -> dict:
+        """Derivation edges around one item, ``depth`` hops out.
+
+        Called ``get_linked_items`` rather than anything with "lineage": an aliquot
+        is not a descendant of its tube, it is a piece of it.
+
+        The MCP tool walks a single hop and makes the caller ask again, so a trace
+        grows only where someone chose to follow it; deeper values exist for Python
+        callers building the whole graph at once. Tombstoned ends still appear --
+        provenance outlives the tube -- carrying ``deleted: true`` so a discarded
+        aliquot is never mistaken for material that still exists.
+        """
         db = self.db
-        edges = db.t("item_parents").rows
+        edges = db.t("item_links").rows
         parents: dict[str, list[dict]] = {}
         children: dict[str, list[dict]] = {}
         for e in edges:
@@ -412,9 +754,12 @@ class Service:
             parent = (e.get("parent_item_id", "") or "").strip()
             if not child or not parent:
                 continue
-            entry = {"item_id": parent, "role": e.get("role", ""), "link_id": e.get("link_id", "")}
+            # An edge is named by its two endpoints, so the surrogate link_id stays
+            # in the table: handing it out would advertise an address nothing here
+            # accepts, and every id shipped is one a caller may try to use.
+            entry = {"item_id": parent, "role": e.get("role", "")}
             parents.setdefault(child, []).append(entry)
-            entry2 = {"item_id": child, "role": e.get("role", ""), "link_id": e.get("link_id", "")}
+            entry2 = {"item_id": child, "role": e.get("role", "")}
             children.setdefault(parent, []).append(entry2)
         items = db.items_by_id()
 
@@ -428,6 +773,7 @@ class Service:
                         "name": row.get("name", "?"),
                         "class": row.get("class", "?"),
                         "status": row.get("status", "?"),
+                        "deleted": bool((row.get("deleted_at", "") or "").strip()),
                     }
                 )
             return out
@@ -439,6 +785,7 @@ class Service:
                 "name": row.get("name", "?"),
                 "class": row.get("class", "?"),
                 "status": row.get("status", "?"),
+                "deleted": bool((row.get("deleted_at", "") or "").strip()),
             }
             if remaining <= 0:
                 return node
@@ -487,7 +834,7 @@ class Service:
         cols: int | str = "",
         row_labels: str = "",
         col_labels: str = "",
-        capacity_override: int | str = "",
+        capacity: int | str = "",
         notes: str = "",
     ) -> CommitResult:
         cid = ids.new_id(schema.CONTAINERS.id_prefix)
@@ -500,7 +847,7 @@ class Service:
             "cols": _s(cols),
             "row_labels": row_labels,
             "col_labels": col_labels,
-            "capacity_override": _s(capacity_override),
+            "capacity": _s(capacity),
             "notes": notes,
         }
         result = self._apply("create_container", [("containers", [row], [])])
@@ -771,11 +1118,22 @@ class Service:
             raise ServiceError(f"unknown fields: {sorted(changes)}")
         return self.record_measurement(**new_kwargs)
 
-    def link_parent(self, child_item_id: str, parent_item_id: str, role: str, notes: str = "") -> CommitResult:
+    def link_items(self, child_item_id: str, parent_item_id: str, role: str, notes: str = "") -> CommitResult:
         self._require_item(child_item_id)
         self._require_item(parent_item_id)
-        if role not in schema.PARENT_ROLES:
-            raise ServiceError(f"role must be one of {schema.PARENT_ROLES}")
+        if role not in schema.LINK_ROLES:
+            raise ServiceError(f"role must be one of {schema.LINK_ROLES}")
+        pair = (child_item_id.strip(), parent_item_id.strip())
+        # The two endpoints name the edge, so a second row between the same pair is
+        # a duplicate rather than a second relationship -- whatever its role claims.
+        for r in self.db.t("item_links").rows:
+            existing = ((r.get("child_item_id", "") or "").strip(),
+                        (r.get("parent_item_id", "") or "").strip())
+            if existing == pair:
+                raise Conflict(
+                    f"{pair[0]} is already linked to {pair[1]} as {r.get('role', '')!r}"
+                    " -- two item ids name one edge"
+                )
         lid = ids.new_id("lin")
         row = {
             "link_id": lid,
@@ -784,7 +1142,7 @@ class Service:
             "role": role,
             "notes": notes,
         }
-        result = self._apply("link_parent", [("item_parents", [row], [])])
+        result = self._apply("link_items", [("item_links", [row], [])])
         result.records = [row]
         return result
 
@@ -983,8 +1341,8 @@ class Service:
         # recreate.
         for table, fk_field in (
             ("measurements", "item_id"),
-            ("item_parents", "child_item_id"),
-            ("item_parents", "parent_item_id"),
+            ("item_links", "child_item_id"),
+            ("item_links", "parent_item_id"),
         ):
             source = final.get(table)
             if source is None:
@@ -996,7 +1354,7 @@ class Service:
                     kept.append(r)
                     continue
                 r[fk_field] = keep_id
-                if table == "item_parents" and r["child_item_id"] == r["parent_item_id"]:
+                if table == "item_links" and r["child_item_id"] == r["parent_item_id"]:
                     moved += 1
                     continue  # merging would have created a self-edge; drop it
                 kept.append(r)
@@ -1156,11 +1514,17 @@ class Service:
                 "storage_requirements": ext.get("storage_requirements", ""),
             }
         if not summary:
-            out["latest_measurements"] = self.get_measurements(item_id=iid, latest_only=True)
-            lin = self.lineage(iid, direction="both", depth=1)
-            out["parents"] = lin.get("parents", [])
-            out["children"] = lin.get("children", [])
+            out["latest_measurements"] = [
+                self._brief_reading(m)
+                for m in self.get_measurements(item_id=iid)
+            ]
         return out
+
+    @staticmethod
+    def _brief_reading(m: dict) -> dict:
+        """Latest readings inline are a glance; history and correction ids are
+        ``get_measurements``, which keeps the columns dropped here."""
+        return {k: m[k] for k in ("assay", "measured_on", "value", "unit")}
 
     def _labels_for(self, ext: dict) -> dict[str, str]:
         out = {}
@@ -1176,7 +1540,7 @@ class Service:
 
     def _container_summary(self, cid: str, row: dict) -> dict:
         db = self.db
-        occupants = db.occupants(cid)
+        kids = db.child_containers(cid)
         cap = db.capacity_of(cid)
         return {
             "container_id": cid,
@@ -1186,30 +1550,35 @@ class Service:
             "path": " / ".join(db.container_path(cid)),
             "geometry": self._geometry(row),
             "capacity": cap,
-            "occupied": len(occupants),
+            # Slots taken, nested containers included: a rack holding five boxes is
+            # full, not empty with five boxes somewhere beneath it.
+            "occupied": len(db.occupants(cid)) + len(kids),
+            "child_containers": len(kids),
             "notes": row.get("notes", ""),
         }
 
     @staticmethod
     def _geometry(row: dict) -> str:
+        """Well grid as ``rows x cols``; empty for furniture, whose slots are ``capacity``."""
         r, c = (row.get("rows", "") or "").strip(), (row.get("cols", "") or "").strip()
-        if r and c:
-            return f"{r}x{c}"
-        ov = (row.get("capacity_override", "") or "").strip()
-        return f"capacity {ov}" if ov else ""
+        return f"{r}x{c}" if r and c else ""
 
     def _rollup(self, axis: str, **kwargs) -> list[dict]:
-        items = self.search_items(**kwargs)
-        key_field = {"patient": "patient_id", "project": "project_id", "container": None}[axis]
+        """Group matching items by a flat link and count them per status.
+
+        Only one axis uses this now. ``patient`` moved to ``search_patients``, which
+        enumerates people rather than items, and there is no container axis because
+        storage is a tree -- grouping by an item's direct container counts boxes and
+        never their freezer. ``get_occupancy`` walks that hierarchy; this does not.
+        """
+        items = self._matching_items(**kwargs)
+        key_field = {"project": "project_id"}[axis]
+        label_field = "project_name"
         buckets: dict[str, dict] = {}
         for it in items:
-            if axis == "container":
-                key = it["location"]["container_id"] or "(unlocated)"
-                label = it["location"]["path"] or "unlocated"
-            else:
-                sub = it.get("sample") or {}
-                key = sub.get(key_field, "") or "(none)"
-                label = sub.get("patient_label" if axis == "patient" else "project_name", "") or key
+            sub = it.get("sample") or {}
+            key = sub.get(key_field, "") or "(none)"
+            label = sub.get(label_field, "") or key
             b = buckets.setdefault(key, {"key": key, "label": label, "total": 0,
                                          "present": 0, "partially_consumed": 0, "consumed": 0})
             b["total"] += 1

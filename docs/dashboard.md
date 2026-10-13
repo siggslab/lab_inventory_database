@@ -27,9 +27,9 @@ Writes to `<root>/exports/`:
 | File | What it is |
 | --- | --- |
 | `items_wide.csv` | One row per item, supertype joined to its extension, container resolved to a path, latest Qubit/Nanodrop/volume flattened into columns |
-| `occupancy.csv` | One row per container: capacity, occupied, free, percent, how many wells are actually recorded |
+| `occupancy.csv` | One row per container: capacity in slots, slots taken (`items_held` + `child_containers`), free, percent |
 | `measurements_long.csv` | Every measurement including superseded ones, with the value converted to the assay's canonical unit |
-| `lineage.csv` | Flat parent→child edges with both names resolved |
+| `item_links.csv` | Flat parent→child edges with both names resolved |
 | `patient_projects.csv` | Enrolments with participant and project names resolved |
 | `inventory.sqlite` | The twelve authoritative tables plus the denormalised views above, ready for anything that speaks SQL |
 | `manifest.json` | When this was generated, which revision of each source table it reflects, and the integrity state at that moment |
@@ -42,7 +42,7 @@ tables exactly — there is a test asserting it.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 3,
   "generated_at": "2026-10-06T09:14:02Z",
   "backend": "local_csv:/srv/lab/db",
   "source_revisions": {"items": "9f2c…", "samples": "b71a…"},
@@ -79,14 +79,23 @@ has the right yield, with nothing left to reconcile.
 from inventory_mcp.service import Service
 
 svc = Service.open("/path/to/config.json")       # or a Config object
-svc.search_items(item_class="sample", status="present", container_subtree=True)
-svc.occupancy(container_id="ctr_8kv1f3kc")
+svc.search_items(item_class="sample", status="present")
+svc.contents(container_id="ctr_8kv1f3kc", recursive=True)   # what is inside
+svc.get_occupancy(container_id="ctr_8kv1f3kc", kind="sample")  # room for a tube here
+svc.get_occupancy(container_id="ctr_fzqav521", kind="box")     # room for a box here
 svc.run_query("select name, container_path from items_wide where class='sample'")
 ```
 
 This is the same code the MCP tools call, so you get identical filtering,
 identical unit conversion, identical derived fields — and the validators, which
 matters if your dashboard also writes. Nothing here knows MCP exists.
+
+`search_items` rows are deliberately lean: identity, status, location and the
+class ids/labels needed to filter further. Call `get_item(id)` for the rest
+(notes, handler, dates, related-object ids, latest readings as
+`{assay, measured_on, value, unit}`); measurement history and derivation links
+stay in `get_measurements` and `get_linked_items`, or read `items_wide` for
+everything at once.
 
 Exceptions worth catching: `ValidationError` (carries `.violations`),
 `NotFound`, `Conflict`, `ServiceError`.
@@ -110,10 +119,11 @@ sqlite3 -header -column .devdb/exports/inventory.sqlite \
 ```
 
 Objects in the mirror: the twelve tables, then `items_wide`, `occupancy`,
-`measurements_long`, `lineage` as materialised tables; `latest_measurements` and
-`patient_projects_named` as views. `patient_projects` stays the raw junction
-table — the denormalised version is `patient_projects_named`, because shadowing
-an authoritative table with a derived copy is how dashboards end up lying.
+`measurements_long` as materialised tables; `latest_measurements`,
+`patient_projects_named` and `item_links_named` as views. The two junctions
+`patient_projects` and `item_links` stay raw — their labelled forms are the
+`_named` views, because shadowing an authoritative table with a derived copy is
+how dashboards end up lying.
 
 ## Stability
 
@@ -139,16 +149,26 @@ an authoritative table with a derived copy is how dashboards end up lying.
 - **Deleted rows are still there.** `items.deleted_at` non-empty means tombstoned.
   `search_items` hides them; `items_wide` includes them with the timestamp so
   history doesn't silently shrink. Filter explicitly.
-- **Superseded measurements are still there.** `get_measurements` hides them by
-  default; `measurements_long.csv` keeps them with `superseded=yes|no` and
+- **Superseded measurements are still there.** `get_measurements` answers with one row
+  per item and assay — the newest reading the database currently believes. Corrections
+  need `include_superseded`, the whole series needs `include_historical`.
+  `measurements_long.csv` keeps everything, with `superseded=yes|no` and
   `supersedes` pointing at the row it replaced. Sum without filtering and you'll
   double-count.
-- **Positions are sparse.** Most rows are recorded at box level. `occupied` counts
-  tubes; `with_known_well` counts tubes anyone can point at. An empty position is
+- **Positions are convenience, not accounting.** Most rows are recorded at box level.
+  `position` in `items_wide` is whatever someone typed, and occupancy ignores it: an
+  unlabelled tube fills a slot exactly like one filed under A1. An empty position is
   not a free well, and no query can tell you otherwise.
+- **Capacity is slots, and a nested container fills one.** `occupied` = `items_held`
+  + `child_containers`, so a rack holding six of its six box positions reads full
+  while holding zero tubes. Don't add `capacity` down a subtree: a freezer's four
+  shelf positions and its boxes' 181 wells are different units, and only containers
+  holding the same kind of thing are ever summed by the tools.
 - **Units are canonical on read.** Stored values keep whatever unit was entered;
   `canonical_value` / `canonical_unit` carry the converted form. Chart the
-  canonical pair, or your axis means three things at once.
+  canonical pair, or your axis means three things at once. The MCP's reading rows
+  deliberately omit the conversion — a model quoting a number back should quote the
+  one that was observed, with the unit that was entered.
 - **Dates normalise to ISO.** `YYYY-MM-DD` and `YYYY-MM-DDTHH:MM`, UTC minute
   precision. An ambiguous day/month like `03/04/1980` is flagged rather than
   guessed, so expect to see it in `doctor` output until someone fixes the source.

@@ -64,6 +64,12 @@ class TestExport:
                 "SELECT patient_label, project_name FROM patient_projects_named LIMIT 1"
             ).fetchall()
             assert named
+            # the mirror keeps the real item_links table, so the labelled edges are
+            # a SQL view rather than the denormalised copy the CSV carries
+            edges = conn.execute(
+                "SELECT child_name, parent_name FROM item_links_named LIMIT 1"
+            ).fetchall()
+            assert edges and all(edges[0]), "both ends should be resolved to names"
         finally:
             conn.close()
 
@@ -119,12 +125,14 @@ class TestToolSurface:
         tools = {t.name: t for t in mcp._tool_manager.list_tools()}
         expected = {
             "doctor", "search_items", "get_item", "list_containers", "container_tree",
-            "occupancy", "count_items", "rollup_by_patient", "rollup_by_project",
-            "rollup_by_container", "get_measurements", "lineage", "run_query",
+            "get_contents", "get_occupancy", "count_items", "search_patients",
+            "rollup_by_project", "get_measurements",
+            "get_linked_items",
+            "run_query",
             "create_container", "create_box", "create_sample", "create_supply",
             "create_patient", "create_project", "assign_patient_project", "create_assay",
             "move_item", "set_status", "update_fields",
-            "record_measurement", "correct_measurement", "link_parent",
+            "record_measurement", "correct_measurement", "link_items",
             "delete_item", "delete_container", "merge_items", "export_data",
         }
         missing = expected - set(tools)
@@ -146,6 +154,72 @@ class TestToolSurface:
         assert "required" not in props["patient_id"], "optional fields must look optional"
         # a tool with no parameters must accept an empty argument object
         assert tools["doctor"].parameters["properties"] == {}
+
+    def test_advertised_schemas_carry_no_derived_titles(self):
+        """pydantic's ``title`` twins restate the field name below them and cost
+        context on every listing, so the server strips them at the wire boundary.
+        Registration keeps them -- assertions here are on what list_tools returns.
+        """
+        import asyncio
+
+        from inventory_mcp.tools import mcp
+
+        def count_titles(node):
+            if isinstance(node, dict):
+                return ("title" in node) + sum(count_titles(v) for v in node.values())
+            if isinstance(node, list):
+                return sum(count_titles(v) for v in node)
+            return 0
+
+        advertised = asyncio.run(mcp.list_tools())
+        assert len(advertised) == len(mcp._tool_manager.list_tools())
+        for tool in advertised:
+            assert count_titles(tool.input_schema) == 0, f"{tool.name} advertises titles"
+
+    def test_descriptions_ship_without_their_source_indentation(self):
+        """Docstrings are indented four spaces where they are written, and that
+        padding used to travel with every line of every description."""
+        import asyncio
+
+        from inventory_mcp.tools import mcp
+
+        for tool in asyncio.run(mcp.list_tools()):
+            assert "\n    " not in tool.description, f"{tool.name} ships indentation"
+            assert tool.description == tool.description.strip()
+
+    def test_direction_offers_only_the_values_it_accepts(self):
+        """A constrained parameter is a shorter conversation than a prose list a
+        caller can ignore and then wonder why the answer came back empty."""
+        import asyncio
+
+        from inventory_mcp.tools import mcp
+
+        tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
+        direction = tools["get_linked_items"].input_schema["properties"]["direction"]
+        assert direction["enum"] == ["parents", "children", "both"]
+        assert direction["default"] == "both"
+
+    def test_only_the_item_is_required_of_a_measurement_query(self):
+        """Annotated defaults are easy to lose, and the one argument that must stay
+        required is the subject: without an item this answers for every tube."""
+        import asyncio
+
+        from inventory_mcp.tools import mcp
+
+        advertised = {t.name: t for t in asyncio.run(mcp.list_tools())}
+        tool = advertised["get_measurements"]
+        props = tool.input_schema["properties"]
+        assert tool.input_schema["required"] == ["item_id"]
+        assert props["assay"]["default"] == ""
+        assert props["include_historical"]["default"] is False
+        assert all(p.get("description") for p in props.values()), "every param should say what it wants"
+
+    def test_measurements_refuse_to_answer_without_an_item(self, seeded):
+        from inventory_mcp.tools import get_measurements, set_service
+
+        set_service(seeded)
+        assert get_measurements("").startswith("ERROR")
+        assert "NotFound" in get_measurements("smp_00000000")
 
     def test_write_refusals_come_back_as_prose_not_tracebacks(self, seeded):
         from inventory_mcp.tools import create_sample, set_service

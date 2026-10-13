@@ -135,7 +135,7 @@ QUANTITIES = (
     "other",
 )
 
-PARENT_ROLES = ("aliquot_of", "extracted_from", "pooled_into", "derived_from", "other")
+LINK_ROLES = ("aliquot_of", "extracted_from", "pooled_into", "derived_from", "other")
 
 
 # ---------------------------------------------------------------------------
@@ -169,16 +169,17 @@ CONTAINERS = Table(
     doc=(
         "Storage locations as a variable-depth tree. A freezer contains shelves, "
         "a rack holds boxes, a box holds items. Depth is not fixed: a bench or a "
-        "liquid-nitrogen shipper may hang items directly. Containers know only "
-        "where things are -- no scientific data belongs here."
+        "liquid-nitrogen shipper may hang items directly. Every container holds "
+        "slots, and a slot is filled by one thing -- a tube or a nested container. "
+        "Containers know only where things are; no scientific data belongs here."
     ),
     fields=(
         Field("container_id", "id", required=True),
         Field("parent_id", "id", fk="containers.container_id", doc="Empty for a top-level container."),
         Field("kind", "str", required=True, enum=CONTAINER_KINDS),
         Field("label", "str", required=True, doc="Human-readable name. Mutable, not a key."),
-        Field("rows", "int", doc="Grid rows. Required for box-like containers."),
-        Field("cols", "int", doc="Grid columns. Required for box-like containers."),
+        Field("rows", "int", doc="Grid rows. Wells only -- leave empty for furniture."),
+        Field("cols", "int", doc="Grid columns. Wells only -- leave empty for furniture."),
         Field(
             "row_labels",
             "str",
@@ -190,9 +191,12 @@ CONTAINERS = Table(
             doc="Column label sequence, default 1,2,3... Override for odd conventions.",
         ),
         Field(
-            "capacity_override",
+            "capacity",
             "int",
-            doc="Overrides rows*cols for non-grid containers (e.g. an informal box).",
+            doc="How many things fit: tubes, boxes, anything. A box grid implies "
+            "this from rows*cols, so leave empty there; set it on furniture that "
+            "holds nested containers (a rack holding five boxes) and on boxes "
+            "recorded without a grid.",
         ),
         Field("notes", "text"),
         *_AUDIT_FIELDS,
@@ -349,13 +353,13 @@ PATIENT_PROJECTS = Table(
     ),
 )
 
-ITEM_PARENTS = Table(
-    name="item_parents",
-    filename="item_parents.csv",
+ITEM_LINKS = Table(
+    name="item_links",
+    filename="item_links.csv",
     primary_key="link_id",
     id_prefix="lin",
     doc=(
-        "Lineage as a junction rather than a parent_id column: aliquoting is "
+        "Derivation as a junction rather than a parent_id column: aliquoting is "
         "one-parent-many-children and pooling is many-parent-one-child, and both "
         "are the same relation. Endpoints are any item class."
     ),
@@ -363,7 +367,7 @@ ITEM_PARENTS = Table(
         Field("link_id", "id", required=True),
         Field("child_item_id", "id", required=True, fk="items.item_id"),
         Field("parent_item_id", "id", required=True, fk="items.item_id"),
-        Field("role", "str", required=True, enum=PARENT_ROLES),
+        Field("role", "str", required=True, enum=LINK_ROLES),
         Field("notes", "text"),
     ),
 )
@@ -427,7 +431,7 @@ TABLES: tuple[Table, ...] = (
     PATIENTS,
     PROJECTS,
     PATIENT_PROJECTS,
-    ITEM_PARENTS,
+    ITEM_LINKS,
     ASSAYS,
     MEASUREMENTS,
 )

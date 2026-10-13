@@ -228,7 +228,7 @@ def validate(db: Database) -> list[Violation]:
     out.extend(_validate_status_location(db))
     out.extend(_validate_sample_project_rule(db))
     out.extend(_validate_measurements(db))
-    out.extend(_validate_lineage(db))
+    out.extend(_validate_item_links(db))
     return out
 
 
@@ -430,6 +430,26 @@ def _validate_containers(db: Database) -> list[Violation]:
             elif rows_v * cols_v > 2000:
                 out.append(Violation("containers", cid, "rows", "implausible_geometry", "warning",
                                      f"geometry {rows_v}x{cols_v} exceeds 2000 wells; check for a typo"))
+            elif row.get("kind", "") != "box":
+                # A grid means wells, and positions are checked against it. Furniture
+                # that holds boxes has slots, not wells, so its number belongs in
+                # capacity -- where counting a slot as a well would quietly lie.
+                out.append(Violation(
+                    "containers", cid, "rows", "grid_on_furniture", "warning",
+                    f"{row.get('kind', '')!r} declares a {rows_v}x{cols_v} well grid; "
+                    "grids mean wells and belong on a box. If this holds nested "
+                    "containers, record them as capacity instead."
+                ))
+        cap_v = _int_or_none(row.get("capacity"))
+        if cap_v is not None and cap_v <= 0:
+            out.append(Violation("containers", cid, "capacity", "bad_capacity", "error",
+                                 f"capacity {cap_v} is not positive"))
+        elif cap_v is not None and rows_v and cols_v and cap_v != rows_v * cols_v:
+            out.append(Violation(
+                "containers", cid, "capacity", "capacity_disagrees_with_grid", "warning",
+                f"capacity {cap_v} contradicts the {rows_v}x{cols_v} grid "
+                f"({rows_v * cols_v} wells); the stated capacity wins"
+            ))
     return out
 
 
@@ -462,18 +482,23 @@ def _validate_positions(db: Database) -> list[Violation]:
             out.append(Violation("items", occupants[0], "position", "double_booked_well", "error",
                                  f"well {pos} of {containers[loc].get('label', loc)!r} is claimed by "
                                  f"{len(occupants)} items: {', '.join(occupants)}"))
-    # occupancy vs capacity
+    # slots vs capacity
     for cid, container in containers.items():
         cap = db.capacity_of(cid)
         if cap is None:
             continue
-        n = len(db.occupants(cid))
-        if n > cap:
-            out.append(Violation("containers", cid, "capacity_override", "over_capacity", "error",
-                                 f"{n} items are stored but capacity is {cap}"))
-        elif n == cap:
+        occ = db.occupants(cid)
+        kids = db.child_containers(cid)
+        used = len(occ) + len(kids)
+        if used > cap:
+            what = " and ".join(
+                f"{n} {word}" for n, word in ((len(occ), "items"), (len(kids), "containers")) if n
+            )
+            out.append(Violation("containers", cid, "capacity", "over_capacity", "error",
+                                 f"{what} are stored here but capacity is {cap}"))
+        elif used == cap:
             out.append(Violation("containers", cid, "", "at_capacity", "warning",
-                                 f"container is full ({n}/{cap})"))
+                                 f"container is full ({used}/{cap})"))
     return out
 
 
@@ -574,20 +599,28 @@ def _validate_measurements(db: Database) -> list[Violation]:
     return out
 
 
-def _validate_lineage(db: Database) -> list[Violation]:
+def _validate_item_links(db: Database) -> list[Violation]:
     out: list[Violation] = []
-    t = db.t("item_parents")
+    t = db.t("item_links")
     if t.missing:
         return out
     children_to_parents: dict[str, set[str]] = {}
+    recorded: dict[tuple[str, str], str] = {}
     for row in t.rows:
         lid = (row.get("link_id", "") or "").strip()
         child = (row.get("child_item_id", "") or "").strip()
         parent = (row.get("parent_item_id", "") or "").strip()
         if child and parent and child == parent:
-            out.append(Violation("item_parents", lid, "parent_item_id", "self_lineage", "error",
+            out.append(Violation("item_links", lid, "parent_item_id", "self_link", "error",
                                  "an item cannot be its own parent"))
         if child and parent:
+            pair = (child, parent)
+            if pair in recorded:
+                out.append(Violation("item_links", lid, "parent_item_id", "duplicate_edge", "error",
+                                     f"{child} -> {parent} is recorded twice (also "
+                                     f"{recorded[pair]}); two item ids name one edge"))
+            else:
+                recorded[pair] = lid
             children_to_parents.setdefault(child, set()).add(parent)
 
     def has_cycle() -> Optional[str]:
@@ -612,8 +645,8 @@ def _validate_lineage(db: Database) -> list[Violation]:
 
     cyclic = has_cycle()
     if cyclic:
-        out.append(Violation("item_parents", cyclic, "parent_item_id", "lineage_cycle", "error",
-                             "lineage contains a cycle -- an item is its own ancestor"))
+        out.append(Violation("item_links", cyclic, "parent_item_id", "derivation_cycle", "error",
+                             "derivation links contain a cycle -- an item is its own ancestor"))
     return out
 
 

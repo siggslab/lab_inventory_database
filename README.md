@@ -83,7 +83,7 @@ kits              extends items     consumables extends items
 patients          participants, kept separate from samples
 projects          optionally nested via parent_project_id
 patient_projects  who is enrolled in what
-item_parents      lineage edges: derived_from, extracted_from, aliquot_of, pooled_into
+item_links        derivation edges: derived_from, extracted_from, aliquot_of, pooled_into
 assays            registry of measurement kinds, with quantity and canonical unit
 measurements      immutable observations referencing an assay
 ```
@@ -106,7 +106,7 @@ Design decisions worth knowing before changing anything:
 - **Measurements never change.** A correction appends a new row and marks the old
   one superseded. Derived quantities like total yield are computed on read, so
   there is nothing to invalidate.
-- **Lineage is a junction table.** Aliquots today, pools later — many parents into
+- **Derivation is a junction table.** Aliquots today, pools later — many parents into
   one child needs no migration because the shape was already there.
 
 ## Integrity contract
@@ -224,7 +224,7 @@ What changes once the files are remote, honestly stated:
 | `serve` | run the MCP server over stdio |
 | `doctor` | integrity report; exit 1 when errors exist (`--json`, `--quiet`) |
 | `ls` | list items, or `--containers` |
-| `occupancy` | fill levels; `--recursive` rolls a subtree up |
+| `occupancy` | fill levels per container (`[container_id]`, `--kind`) |
 | `query` | guarded read-only SQL |
 | `export` | flat CSV views + SQLite mirror + manifest |
 | `schema` | the field-by-field reference (`--json`) |

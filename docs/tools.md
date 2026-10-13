@@ -20,8 +20,14 @@ command is right.
   label people read aloud; it is not a key and the server will tell you so when
   one turns up in a foreign-key field.
 - **positions are optional and never implied.** An empty position means nobody
-  recorded which well, not that the well is free. `occupancy` reports
-  `with_known_well` alongside `occupied` so the gap stays visible.
+  recorded which well, not that the well is free. Occupancy ignores them entirely:
+  a tube nobody placed fills a slot exactly like one filed under `A1`, so fill rates
+  stay true whether or not the grid was ever written down.
+- **capacity counts slots, and a slot takes one thing whatever it is** — a tube in
+  a well, a box in a rack. So `occupied` includes nested containers: a rack holding
+  six boxes is full, not empty. The numbers are only ever added across containers
+  holding the same kind of thing, because five box positions and a hundred wells are
+  not two hundred of anything.
 - **writes either fully apply or don't happen.** Validation runs against a
   candidate state before anything touches storage. A refusal returns every rule
   violated and leaves no partial write, no backup generation, no trace.
@@ -33,15 +39,15 @@ command is right.
 - **destructive calls are guarded.** `delete_item` requires the item to be
   consumed unless `force=true`, and tombstones rather than erasing.
   `delete_container` refuses a non-empty container. `merge_items` re-points
-  measurements and lineage before retiring the duplicate.
+  measurements and derivation links before retiring the duplicate.
 
 ## Groups
 
 | Group | Tools |
 | --- | --- |
-| Inspect | `doctor` `search_items` `get_item` `count_items` `list_containers` `container_tree` `occupancy` `rollup_by_patient` `rollup_by_project` `rollup_by_container` `get_measurements` `lineage` `run_query` |
+| Inspect | `doctor` `search_items` `get_item` `count_items` `list_containers` `container_tree` `get_contents` `get_occupancy` `search_patients` `rollup_by_project` `get_measurements` `get_linked_items` `run_query` |
 | Register | `create_container` `create_box` `create_sample` `create_supply` `create_patient` `create_project` `assign_patient_project` `create_assay` |
-| Change | `move_item` `set_status` `update_fields` `record_measurement` `correct_measurement` `link_parent` |
+| Change | `move_item` `set_status` `update_fields` `record_measurement` `correct_measurement` `link_items` |
 | Destructive | `delete_item` `delete_container` `merge_items` |
 | Publish | `export_data` |
 

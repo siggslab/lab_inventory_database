@@ -136,7 +136,7 @@ class TestSpatialRules:
 
     def test_position_outside_declared_geometry(self, svc, seeded):
         box = next(c for c in seeded.list_containers(kind="box") if c["geometry"] == "9x9")
-        sample = next(i["item_id"] for i in seeded.search_items(item_class="sample")
+        sample = next(i["item_id"] for i in seeded._matching_items(item_class="sample")
                       if not i["location"]["position"])
         from inventory_mcp.service import ValidationError
 
@@ -183,10 +183,46 @@ class TestSpatialRules:
                    list(schema.SAMPLES.column_names))
         assert "over_capacity" in codes(svc.reload().violations)
 
+    def test_nested_containers_fill_capacity_too(self, svc, root):
+        """A rack that holds five boxes has used five slots; counting only tubes
+        would report every piece of furniture as empty."""
+        write_rows(table_path(root, "containers"),
+                   [{"container_id": "ctr_aaaaaaaa", "kind": "rack", "label": "tight",
+                     "capacity": "2"},
+                    {"container_id": "ctr_bbbbbbbb", "parent_id": "ctr_aaaaaaaa",
+                     "kind": "box", "label": "b1", "rows": "1", "cols": "1"},
+                    {"container_id": "ctr_cccccccc", "parent_id": "ctr_aaaaaaaa",
+                     "kind": "box", "label": "b2", "rows": "1", "cols": "1"},
+                    {"container_id": "ctr_dddddddd", "parent_id": "ctr_aaaaaaaa",
+                     "kind": "box", "label": "b3", "rows": "1", "cols": "1"}],
+                   list(schema.CONTAINERS.column_names),
+                   )
+        violations = [v for v in svc.reload().violations if v.row_id == "ctr_aaaaaaaa"]
+        assert "over_capacity" in {v.code for v in violations}
+        assert any("3 containers" in v.message for v in violations)
+
+    def test_well_grid_on_furniture_is_flagged(self, svc, root):
+        """Grids mean wells and positions are checked against them, so a rack declaring
+        one is either a mislabeled box or a slot count in the wrong column."""
+        write_rows(table_path(root, "containers"),
+                   [{"container_id": "ctr_aaaaaaaa", "kind": "rack", "label": "confused",
+                     "rows": "5", "cols": "4"}],
+                   list(schema.CONTAINERS.column_names),
+                   )
+        assert "grid_on_furniture" in codes(svc.reload().violations)
+
+    def test_capacity_contradicting_its_own_grid_is_flagged(self, svc, root):
+        write_rows(table_path(root, "containers"),
+                   [{"container_id": "ctr_aaaaaaaa", "kind": "box", "label": "odd",
+                     "rows": "10", "cols": "10", "capacity": "96"}],
+                   list(schema.CONTAINERS.column_names),
+                   )
+        assert "capacity_disagrees_with_grid" in codes(svc.reload().violations)
+
 
 class TestBusinessRules:
     def test_consumed_item_cannot_hold_a_slot(self, seeded):
-        item = next(i["item_id"] for i in seeded.search_items(status="present")
+        item = next(i["item_id"] for i in seeded._matching_items(status="present")
                     if i["location"]["container_id"])
         seeded.set_status(item, "consumed")
         stored = seeded.db.items_by_id()[item]
@@ -234,7 +270,7 @@ class TestBusinessRules:
                    list(schema.PATIENTS.column_names))
         assert not [v for v in svc.reload().violations if v.code == "bad_date"]
 
-    def test_lineage_cycle_detected(self, svc, root):
+    def test_derivation_cycle_detected(self, svc, root):
         items = [
             {"item_id": "smp_aaaaaaaa", "class": "sample", "name": "a", "status": "present"},
             {"item_id": "smp_bbbbbbbb", "class": "sample", "name": "b", "status": "present"},
@@ -245,11 +281,33 @@ class TestBusinessRules:
                     {"item_id": "smp_bbbbbbbb", "sample_type": "dna"}],
                    list(schema.SAMPLES.column_names))
         write_rows(
-            table_path(root, "item_parents"),
+            table_path(root, "item_links"),
             [{"link_id": "lin_aaaaaaaa", "child_item_id": "smp_aaaaaaaa",
               "parent_item_id": "smp_bbbbbbbb", "role": "aliquot_of"},
              {"link_id": "lin_bbbbbbbb", "child_item_id": "smp_bbbbbbbb",
               "parent_item_id": "smp_aaaaaaaa", "role": "aliquot_of"}],
-            list(schema.ITEM_PARENTS.column_names),
+            list(schema.ITEM_LINKS.column_names),
         )
-        assert "lineage_cycle" in codes(svc.reload().violations)
+        assert "derivation_cycle" in codes(svc.reload().violations)
+
+    def test_duplicate_edge_detected(self, svc, root):
+        """Hand-edited rows can say the same pair is linked twice; only one of them
+        is the edge, so doctor has to name both rather than pick one silently."""
+        items = [
+            {"item_id": "smp_aaaaaaaa", "class": "sample", "name": "a", "status": "present"},
+            {"item_id": "smp_bbbbbbbb", "class": "sample", "name": "b", "status": "present"},
+        ]
+        write_rows(table_path(root, "items"), items, list(schema.ITEMS.column_names))
+        write_rows(table_path(root, "samples"),
+                   [{"item_id": "smp_aaaaaaaa", "sample_type": "dna"},
+                    {"item_id": "smp_bbbbbbbb", "sample_type": "dna"}],
+                   list(schema.SAMPLES.column_names))
+        write_rows(
+            table_path(root, "item_links"),
+            [{"link_id": "lin_aaaaaaaa", "child_item_id": "smp_aaaaaaaa",
+              "parent_item_id": "smp_bbbbbbbb", "role": "aliquot_of"},
+             {"link_id": "lin_bbbbbbbb", "child_item_id": "smp_aaaaaaaa",
+              "parent_item_id": "smp_bbbbbbbb", "role": "derived_from"}],
+            list(schema.ITEM_LINKS.column_names),
+        )
+        assert "duplicate_edge" in codes(svc.reload().violations)

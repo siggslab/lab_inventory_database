@@ -493,7 +493,7 @@ class TestThroughTheService:
         seed(svc)
         present = svc.search_items(item_class="sample", status="present")
         assert present
-        boxes = [c for c in svc.occupancy() if c["grid"]]
+        boxes = [c for c in svc._occupancy_rows() if c["has_capacity"]]
         assert all(b["occupied"] <= b["capacity"] for b in boxes)
         out = svc.run_query("select count(*) n from items where class='sample'")
         assert out["rows"][0]["n"] == 10

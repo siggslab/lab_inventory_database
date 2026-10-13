@@ -3,7 +3,7 @@
 Built by calling the service, not by writing files -- so a bug in the write path
 shows up as a seed failure, and the fixture is a live example of every rule.
 The content mirrors the shape of a real sample inventory: freezers and liquid
-nitrogen shippers, boxes of mixed geometry, lineage chains from blood to DNA,
+nitrogen shippers, boxes of mixed geometry, derivation chains from blood to DNA,
 and reagents with quantities that decrease over time.
 """
 
@@ -33,13 +33,16 @@ def seed(svc: Service) -> dict:
                          result_type=rtype, method=method)
 
     # -- containers -----------------------------------------------------------
-    freezer7085 = svc.create_container("freezer", "-80 Freezer #7085").records or None
+    # Furniture carries capacity in slots, not wells: this freezer has four shelf
+    # positions, the rack six box positions. Fridge and bench are left unmeasured on
+    # purpose so the "nobody recorded it" path stays visible in every report.
+    freezer7085 = svc.create_container("freezer", "-80 Freezer #7085", capacity=4).records or None
     f7085 = _id(freezer7085)
-    shelf3 = _id(svc.create_container("shelf", "Shelf 3", parent_id=f7085).records)
-    rack3 = _id(svc.create_container("rack", "Rack 3", parent_id=shelf3).records)
+    shelf3 = _id(svc.create_container("shelf", "Shelf 3", parent_id=f7085, capacity=3).records)
+    rack3 = _id(svc.create_container("rack", "Rack 3", parent_id=shelf3, capacity=6).records)
 
-    ln2_vp4 = _id(svc.create_container("ln2_shipper", "Liquid Nitrogen VP4").records)
-    rack_c8 = _id(svc.create_container("rack", "Rack C8", parent_id=ln2_vp4).records)
+    ln2_vp4 = _id(svc.create_container("ln2_shipper", "Liquid Nitrogen VP4", capacity=2).records)
+    rack_c8 = _id(svc.create_container("rack", "Rack C8", parent_id=ln2_vp4, capacity=9).records)
 
     box_misc = _id(svc.create_box("-70C Misc", 9, 9, parent_id=rack3,
                                   notes="Labelled 'GML Etienne' on the side").records)
@@ -73,7 +76,7 @@ def seed(svc: Service) -> dict:
     svc.assign_patient_project(shno, vexas)
     svc.assign_patient_project(hc, circa)
 
-    # -- samples with lineage -------------------------------------------------
+    # -- samples with derivation links ----------------------------------------
     blood = _id(svc.create_sample(
         "JaCo whole blood 2024-11-13", "whole_blood", location_id=box_misc, position="A1",
         gml_id="GML001631", patient_id=jacobs, project_id=stat5b,
@@ -87,7 +90,7 @@ def seed(svc: Service) -> dict:
         "JaCo PBMC", "pbmc", location_id=box_pbmc, position="B3",
         gml_id="GML000487", patient_id=jacobs, project_id=stat5b,
         source_material="Venous blood", collected_on="2022-03-03", handler="AMR").records)
-    svc.link_parent(pbmc, blood, "derived_from", "PBMC isolation from the 2022 draw")
+    svc.link_items(pbmc, blood, "derived_from", "PBMC isolation from the 2022 draw")
     _track(svc.record_measurement(pbmc, "cell_count", value="5.3", unit="",
                                   measured_on="2022-03-03T10:00", notes="x10^6 per ml"))
     _track(svc.record_measurement(pbmc, "cell_viability", value="94", unit="%",
@@ -97,7 +100,7 @@ def seed(svc: Service) -> dict:
         "JaCo genomic DNA", "dna", location_id=box_misc, position="C4",
         gml_id="GML000495", patient_id=jacobs, project_id=stat5b,
         source_material="PBMC", handler="Julia").records)
-    svc.link_parent(dna, pbmc, "extracted_from")
+    svc.link_items(dna, pbmc, "extracted_from")
     _track(svc.record_measurement(dna, "qubit_dsdna", value="49.0", unit="ng/ul",
                                   measured_on="2024-05-16T11:00", instrument="Qubit 4"))
     _track(svc.record_measurement(dna, "volume_ul", value="40", unit="ul",
@@ -116,7 +119,7 @@ def seed(svc: Service) -> dict:
         "JaCo DNA aliquot 1", "dna", location_id=box_vexas, position="D7",
         gml_id="GML001994", patient_id=jacobs, project_id=stat5b,
         source_material="genomic DNA", handler="Julia").records)
-    svc.link_parent(aliquot, dna, "aliquot_of")
+    svc.link_items(aliquot, dna, "aliquot_of")
     _track(svc.record_measurement(aliquot, "qubit_dsdna", value="47.2", unit="ng/ul",
                                   measured_on="2024-06-01T09:00"))
     _track(svc.record_measurement(aliquot, "volume_ul", value="20", unit="ul",
@@ -149,7 +152,7 @@ def seed(svc: Service) -> dict:
         "HC_99801143 PBMC", "pbmc", location_id=box_pbmc, position="A1",
         gml_id="GML000664", patient_id=hc, project_id=circa,
         source_material="Venous blood", handler="AMR").records)
-    svc.link_parent(healthy, _id(svc.create_sample(
+    svc.link_items(healthy, _id(svc.create_sample(
         "HC_99801143 whole blood", "whole_blood", location_id=bench,
         gml_id="GML000663", patient_id=hc, project_id=circa,
         notes="temporary bench storage, move to LN2").records), "derived_from")
@@ -228,6 +231,6 @@ def _track(result):
     return result
 
 
-def _last_measurement_id(svc: Service, item_id: str, assay_code: str):
-    rows = svc.get_measurements(item_id=item_id, assay_code=assay_code)
+def _last_measurement_id(svc: Service, item_id: str, assay: str):
+    rows = svc.get_measurements(item_id=item_id, assay=assay)
     return rows[-1]["measurement_id"] if rows else None

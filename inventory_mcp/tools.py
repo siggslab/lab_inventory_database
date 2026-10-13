@@ -12,11 +12,14 @@ that would otherwise come back as confusing rejections.
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import os
-from typing import Any, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from mcp.server.mcpserver import MCPServer
+from mcp_types import Tool as MCPTool
+from pydantic import Field
 
 from . import __version__
 from .config import Config
@@ -40,9 +43,48 @@ Conventions worth knowing before calling anything:
   slot, so setting it clears the location.
 - writes validate before touching storage. If a call is refused, the message
   lists every rule violated and nothing has been written.
+- container kinds: freezer fridge ln2_shipper shelf rack box bench room other.
+- run_query SQL sees the 12 tables (items, samples, reagents, kits, consumables,
+  containers, patients, projects, patient_projects, item_links, assays,
+  measurements) plus views items_wide and latest_measurements.
 """
 
-mcp = MCPServer(
+
+def _drop_titles(schema: Any) -> None:
+    """Delete pydantic's derived ``title`` keys from a JSON schema, in place."""
+    if isinstance(schema, dict):
+        schema.pop("title", None)
+        for value in schema.values():
+            _drop_titles(value)
+    elif isinstance(schema, list):
+        for value in schema:
+            _drop_titles(value)
+
+
+class _Server(MCPServer):
+    """``MCPServer`` that ships lean schemas and unindented descriptions.
+
+    Two things pydantic and Python put on the wire that carry no information for a
+    caller. ``model_json_schema`` writes ``title: "Item Id"`` next to every
+    ``item_id`` and a ``<tool>Arguments`` title on the root; they restate the field
+    name below them. And docstrings are indented four spaces because that is where
+    they live, so every continuation line of every description arrives carrying that
+    padding -- which is re-sent into every context window that lists these tools.
+
+    Both are stripped at the advertise boundary. Argument checking runs against the
+    generated model and the original function, never against what is sent out here,
+    so a call is validated exactly as before.
+    """
+
+    async def list_tools(self) -> list[MCPTool]:
+        tools = await super().list_tools()
+        for tool in tools:
+            _drop_titles(tool.input_schema)
+            tool.description = inspect.cleandoc(tool.description)
+        return tools
+
+
+mcp = _Server(
     "lab-inventory",
     version=__version__,
     instructions=INSTRUCTIONS.strip(),
@@ -105,8 +147,10 @@ def _guard(fn):
 @mcp.tool()
 @_guard
 def doctor() -> str:
-    """Report database integrity: table counts, missing tables, every validation
-    error and warning. Run this after anyone has edited the files by hand."""
+    """Database integrity: counts, missing tables, every error and warning.
+
+    Run after anyone hand-edits the files.
+    """
     return get_service().doctor()
 
 
@@ -119,60 +163,93 @@ def search_items(
     project_id: str = "",
     patient_id: str = "",
     container_id: str = "",
-    container_subtree: bool = False,
     sample_type: str = "",
     gml_id: str = "",
     unlocated: bool = False,
     include_deleted: bool = False,
     has_position: Optional[bool] = None,
 ) -> str:
-    """Find items. All filters combine; empty means unconstrained.
+    """Search for stored items (e.g. samples, reagents) and retrieve id.
 
-    item_class: sample|reagent|kit|consumable. status: present|partially_consumed|consumed.
-    unlocated=True finds items we believe exist but cannot place.
-    container_subtree includes everything below that container, not just direct occupants.
+    Rows are id, name, status, location label and human labels only;
+    get_item returns the rest, including related-object ids and well position.
+    Filters combine; an empty filter is unconstrained.
+    class: sample|reagent|kit|consumable. status: present|partially_consumed|consumed.
+    text also matches notes and handler, which the rows do not show.
+    Pass unlocated=True for no container recorded -- includes consumed items,
+    so pair with status=present to find genuinely lost material.
+    For what is inside a container use get_contents instead.
     """
     return get_service().search_items(
         text=text, item_class=item_class, status=status, project_id=project_id,
         patient_id=patient_id, container_id=container_id,
-        container_subtree=container_subtree, sample_type=sample_type, gml_id=gml_id,
+        sample_type=sample_type, gml_id=gml_id,
         unlocated=unlocated, include_deleted=include_deleted, has_position=has_position,
     )
 
 
 @mcp.tool()
 @_guard
-def get_item(item_id: str, full: bool = True) -> str:
-    """One item with its extension fields, resolved location path, patient and
-    project labels, latest measurements, and immediate lineage."""
-    svc = get_service()
-    if full:
-        return svc.get_item(item_id)
-    return svc._merged_item(svc._require_item(item_id), summary=True)
+def get_item(
+    item_id: Annotated[str, Field(
+        description="Id as returned by search_items or get_contents; never invented.")],
+) -> str:
+    """One item's record by id: fields, location, labels, latest readings.
+
+    Measurement history and derivation links are their own calls:
+    get_measurements, get_linked_items. Related ids appear here, so follow-ups
+    need no lookup.
+    """
+    return get_service().get_item(item_id)
 
 
 @mcp.tool()
 @_guard
 def list_containers(kind: str = "", parent_id: str = "") -> str:
-    """Containers with capacity and current occupancy. kind: freezer|fridge|
-    ln2_shipper|shelf|rack|box|bench|room|other."""
+    """List containers with capacity and occupancy, optionally by kind/parent.
+
+    kinds: freezer fridge ln2_shipper shelf rack box bench room other.
+    """
     return get_service().list_containers(kind=kind, parent_id=parent_id)
 
 
 @mcp.tool()
 @_guard
 def container_tree(root_id: str = "") -> str:
-    """The storage hierarchy as nested nodes, each with capacity and occupancy."""
+    """Storage hierarchy as nested nodes with capacity and occupancy."""
     return get_service().container_tree(root_id=root_id)
 
 
 @mcp.tool()
 @_guard
-def occupancy(container_id: str = "", recursive: bool = False) -> str:
-    """How full containers are. Reports occupied/free/percent plus
-    wells_resolved: false means positions are not fully recorded, so individual
-    free wells cannot be identified -- only the count."""
-    return get_service().occupancy(container_id=container_id, recursive=recursive)
+def get_contents(container_id: str, recursive: bool = False) -> str:
+    """What is stored in a container: lean rows plus free space at the top.
+
+    Pass recursive=True to include items in containers nested below, each row
+    naming its container. Consumed items have no location, so appear nowhere.
+    """
+    return get_service().contents(container_id=container_id, recursive=recursive)
+
+
+@mcp.tool()
+@_guard
+def get_occupancy(
+    container_id: Annotated[str, Field(
+        description="Container id as returned by list_containers or container_tree.")],
+    kind: Annotated[str, Field(
+        description="Report at this level: a container kind (box, rack, shelf...) "
+                    "or an item class (sample, reagent, kit, consumable). Omit for "
+                    "the containers nested directly inside.")] = "",
+) -> str:
+    """How full one container is, at the granularity you ask for.
+
+    Rows are the things of that kind inside it, each with its own figures; summary
+    measures the containers those rows live in -- so asking about boxes counts the
+    slots their rack offers, asking about samples counts wells. Ask a container about
+    its own kind and it measures itself. Slots are never added across tiers, and no
+    figure here depends on a recorded well position.
+    """
+    return get_service().get_occupancy(container_id=container_id, kind=kind)
 
 
 @mcp.tool()
@@ -187,7 +264,11 @@ def count_items(
     sample_type: str = "",
     unlocated: bool = False,
 ) -> str:
-    """Number of items matching filters identical to search_items."""
+    """Answer "how many items match?" without returning the rows.
+
+    Same filters as search_items minus gml_id/include_deleted/has_position.
+    unlocated counts include consumed tubes; add status=present for lost material.
+    """
     svc = get_service()
     return {
         "count": svc.count_items(
@@ -200,9 +281,23 @@ def count_items(
 
 @mcp.tool()
 @_guard
-def rollup_by_patient(project_id: str = "", item_class: str = "") -> str:
-    """Counts per patient, split by status."""
-    return get_service().rollup_by_patient(project_id=project_id, item_class=item_class)
+def search_patients(
+    query: Annotated[str, Field(
+        description="Participant id, or any part of a label, matched case-insensitively.")],
+    project_id: str = "",
+    limit: int = 20,
+) -> str:
+    """Find participants by id or label, with how many samples each holds.
+
+    Rows come back heaviest first and stop at limit, with matched and truncated
+    reported rather than left to be guessed. A participant with nothing stored returns
+    total 0, which is the difference between "not enrolled yet" and "no such person".
+    Only samples carry a participant, so supplies are never counted; project_id narrows
+    the counts without narrowing who is listed. Beside the rows, "unassigned" counts
+    samples held with no participant recorded. No blank query: "pat_" matches every id,
+    which is how you ask for the whole cohort.
+    """
+    return get_service().search_patients(query=query, project_id=project_id, limit=limit)
 
 
 @mcp.tool()
@@ -214,42 +309,51 @@ def rollup_by_project(patient_id: str = "", item_class: str = "") -> str:
 
 @mcp.tool()
 @_guard
-def rollup_by_container(item_class: str = "", status: str = "") -> str:
-    """Counts per container, split by status."""
-    return get_service().rollup_by_container(item_class=item_class, status=status)
-
-
-@mcp.tool()
-@_guard
 def get_measurements(
-    item_id: str = "",
-    assay_code: str = "",
-    latest_only: bool = False,
-    include_superseded: bool = False,
+    item_id: Annotated[str, Field(
+        description="Item id as returned by search_items or get_contents.")],
+    assay: Annotated[str, Field(
+        description="The assay's short code, e.g. qubit_dsdna -- what create_assay "
+                    "registers, not the assay's display name.")] = "",
+    include_historical: Annotated[bool, Field(
+        description="Include measurements replaced with more recent measurements")] = False,
+    include_superseded: Annotated[bool, Field(
+        description="Include measurements replaced with more accurate measurements")] = False,
 ) -> str:
-    """Measurement history. Values are echoed as recorded and converted to the
-    assay's canonical unit under 'canonical'. Superseded rows are hidden unless
-    include_superseded."""
+    """Returns current and (optionally) historical measurements for a given item"""
+    if not item_id.strip():
+        raise ServiceError("item_id is required; there is no all-items mode here")
     return get_service().get_measurements(
-        item_id=item_id, assay_code=assay_code, latest_only=latest_only,
+        item_id=item_id, assay=assay, include_historical=include_historical,
         include_superseded=include_superseded,
     )
 
 
 @mcp.tool()
 @_guard
-def lineage(item_id: str, direction: str = "both", depth: int = 3) -> str:
-    """Derivation graph: aliquots, extractions, pools. direction: parents|children|both."""
-    return get_service().lineage(item_id, direction=direction, depth=depth)
+def get_linked_items(
+    item_id: Annotated[str, Field(
+        description="Item id as returned by search_items or get_contents.")],
+    direction: Annotated[Literal["parents", "children", "both"], Field(
+        description="parents: what this came from. children: what was made from it.")] = "both",
+) -> str:
+    """One hop of derivation: what this came from, what was made from it.
+
+    Ask again about any id below to go one edge further. Each edge names its role:
+    aliquot_of | extracted_from | pooled_into | derived_from | other. A deleted item
+    still appears -- provenance outlives the tube.
+    """
+    return get_service().get_linked_items(item_id, direction=direction)
 
 
 @mcp.tool()
 @_guard
 def run_query(sql: str, limit: int = 500) -> str:
-    """Read-only SQL over the loaded tables (select/with only). Tables: items,
-    samples, reagents, kits, consumables, patients, projects, patient_projects,
-    item_parents, assays, measurements, containers. Views: items_wide,
-    latest_measurements. Use for aggregate questions the fixed tools cannot answer."""
+    """Read-only SQL (select/with only) over the loaded tables and views.
+
+    Table and view names are listed in the server instructions. Use for
+    aggregate questions the fixed tools cannot answer.
+    """
     return get_service().run_query(sql, limit=limit)
 
 
@@ -268,22 +372,27 @@ def create_container(
     cols: str = "",
     row_labels: str = "",
     col_labels: str = "",
-    capacity_override: str = "",
+    capacity: str = "",
     notes: str = "",
 ) -> str:
-    """Add a storage location. Grid geometry only applies to box-like containers;
-    use capacity_override for informal ones."""
+    """Add a storage location (freezer, shelf, rack, box, bench, room...).
+
+    ``capacity`` is how many things fit here -- tubes or nested containers, one slot
+    each. A gridded box gets it from rows*cols, so leave it empty there; set it on
+    furniture that holds boxes, and on boxes recorded without a grid. rows/cols
+    describe wells, so they belong on a box and nowhere else.
+    """
     return get_service().create_container(
         kind=kind, label=label, parent_id=parent_id, rows=rows, cols=cols,
         row_labels=row_labels, col_labels=col_labels,
-        capacity_override=capacity_override, notes=notes,
+        capacity=capacity, notes=notes,
     )
 
 
 @mcp.tool()
 @_guard
 def create_box(label: str, rows: int, cols: int, parent_id: str, notes: str = "") -> str:
-    """Add a grid box to a rack/shelf. Boxes may be any geometry (10x10, 9x9, 12x8)."""
+    """Add a grid box to a rack/shelf; any geometry (10x10, 9x9, 12x8)."""
     return get_service().create_box(label=label, rows=rows, cols=cols,
                                     parent_id=parent_id, notes=notes)
 
@@ -305,10 +414,12 @@ def create_sample(
     handler: str = "",
     notes: str = "",
 ) -> str:
-    """Register a physical tube. sample_type is required (whole_blood, pbmc, dna,
-    library, ...). Dates are YYYY-MM-DD. If both patient_id and project_id are
-    given, the patient must be registered under that project or an ancestor.
-    Omit location_id when the whereabouts are unknown -- that is a real answer."""
+    """Register a physical tube. sample_type required; dates YYYY-MM-DD.
+
+    Patient+project, if both given, must already be paired via
+    assign_patient_project. Omitting location_id is an honest answer when the
+    whereabouts are unknown, not an error.
+    """
     return get_service().create_sample(
         name=name, sample_type=sample_type, location_id=location_id, position=position,
         gml_id=gml_id, patient_id=patient_id, project_id=project_id,
@@ -331,9 +442,11 @@ def create_supply(
     quantity_unit: str = "",
     notes: str = "",
 ) -> str:
-    """Register a reagent, kit or consumable. Quantity is a measurement, not a
-    column: pass initial_quantity with quantity_assay (e.g. reagent_volume) and
-    later readings just append."""
+    """Register a reagent, kit or consumable; item_class picks which.
+
+    Quantity is a measurement, not a column: pass initial_quantity with
+    quantity_assay (e.g. reagent_volume); later readings just append.
+    """
     return get_service().create_supply(
         item_class=item_class, name=name, location_id=location_id, price=price,
         expires_on=expires_on, storage_requirements=storage_requirements,
@@ -350,8 +463,10 @@ def move_item(
     position: Optional[str] = None,
     clear_location: bool = False,
 ) -> str:
-    """Relocate an item. Moving between containers drops an old well position
-    unless a new one is given. Refuses if the target well is already claimed."""
+    """Relocate an item. Changing containers drops the old well position.
+
+    Refuses if the target well is claimed; clear_location empties the slot.
+    """
     return get_service().move_item(
         item_id=item_id, location_id=location_id, position=position,
         clear_location=clear_location,
@@ -361,9 +476,10 @@ def move_item(
 @mcp.tool()
 @_guard
 def set_status(item_id: str, status: str, allow_backwards: bool = False) -> str:
-    """present | partially_consumed | consumed. Consuming clears the location
-    because the slot is physically free again. Going backwards needs
-    allow_backwards since it usually means something was mis-recorded."""
+    """Set present | partially_consumed | consumed; consuming clears the slot.
+
+    allow_backwards permits reversing, which usually flags a mis-record.
+    """
     return get_service().set_status(item_id, status, allow_backwards=allow_backwards)
 
 
@@ -380,9 +496,11 @@ def record_measurement(
     instrument: str = "",
     notes: str = "",
 ) -> str:
-    """Append an observation. Numeric assays take value+unit, textual assays take
-    text. Units are checked against the assay's quantity, so a concentration
-    cannot be recorded in microlitres."""
+    """Append an observation. Numeric: value+unit. Textual assays: text.
+
+    Units are checked against the assay's quantity, so a concentration cannot
+    be recorded in microlitres.
+    """
     return get_service().record_measurement(
         item_id=item_id, assay=assay, value=value, unit=unit, text=text,
         measured_on=measured_on, handler=handler, instrument=instrument, notes=notes,
@@ -400,8 +518,7 @@ def correct_measurement(
     instrument: str = "",
     notes: str = "",
 ) -> str:
-    """Fix a bad reading by appending a corrected one and marking the original
-    superseded. The original row is never edited or deleted."""
+    """Append a correction; the original is marked superseded, never edited."""
     changes = {
         k: v
         for k, v in {
@@ -432,9 +549,11 @@ def update_fields(
     processed_on: Optional[str] = None,
     gml_id: Optional[str] = None,
 ) -> str:
-    """Edit descriptive fields on any table. Ids, class, status and foreign keys
-    are rejected here -- they have their own operations because they carry
-    structural consequences. Omit a field to leave it unchanged."""
+    """Edit descriptive fields on any table. Ids/class/status/FKs: not here.
+
+    Those carry structural consequences and have their own operations. Omit a
+    field to leave it unchanged.
+    """
     changes = {
         k: ("" if v is None else v)
         for k, v in {
@@ -453,10 +572,12 @@ def update_fields(
 
 @mcp.tool()
 @_guard
-def link_parent(child_item_id: str, parent_item_id: str, role: str, notes: str = "") -> str:
-    """Record derivation. role: aliquot_of | extracted_from | pooled_into |
-    derived_from | other."""
-    return get_service().link_parent(child_item_id, parent_item_id, role, notes)
+def link_items(child_item_id: str, parent_item_id: str, role: str, notes: str = "") -> str:
+    """Record a derivation edge between two items.
+
+    role: aliquot_of | extracted_from | pooled_into | derived_from | other.
+    """
+    return get_service().link_items(child_item_id, parent_item_id, role, notes)
 
 
 @mcp.tool()
@@ -485,7 +606,7 @@ def create_project(name: str, status: str = "active", parent_project_id: str = "
 @mcp.tool()
 @_guard
 def assign_patient_project(patient_id: str, project_id: str) -> str:
-    """Enrol a participant in a project. Required before a sample can pair them."""
+    """Enrol a participant in a project. Required before a sample pairs them."""
     return get_service().assign_patient_project(patient_id, project_id)
 
 
@@ -493,9 +614,11 @@ def assign_patient_project(patient_id: str, project_id: str) -> str:
 @_guard
 def create_assay(code: str, name: str, quantity: str, canonical_unit: str,
                  result_type: str = "numeric", method: str = "", notes: str = "") -> str:
-    """Define a new kind of measurement. Declare the quantity and canonical unit
-    carefully -- values recorded against an assay are compared within it, and
-    two methods reporting ng/ul are not necessarily measuring the same thing."""
+    """Define a kind of measurement: a quantity and its canonical unit.
+
+    Choose carefully -- readings are compared within an assay, and two methods
+    reporting ng/ul are not necessarily measuring the same thing.
+    """
     return get_service().create_assay(
         code=code, name=name, quantity=quantity, canonical_unit=canonical_unit,
         result_type=result_type, method=method, notes=notes,
@@ -510,30 +633,34 @@ def create_assay(code: str, name: str, quantity: str, canonical_unit: str,
 @mcp.tool()
 @_guard
 def delete_item(item_id: str, force: bool = False) -> str:
-    """Tombstone an item. Only consumed items can be discarded without force,
-    since discarding material that still exists is a different claim. Rows are
-    kept for provenance rather than removed."""
+    """Tombstone an item; the row stays for provenance.
+
+    Non-consumed items need force=true, since discarding material that still
+    exists is a different claim.
+    """
     return get_service().delete_item(item_id, force=force)
 
 
 @mcp.tool()
 @_guard
 def delete_container(container_id: str) -> str:
-    """Remove an empty container. Refuses while it holds items or child containers."""
+    """Remove a container. Refuses while it holds items or child containers."""
     return get_service().delete_container(container_id)
 
 
 @mcp.tool()
 @_guard
 def merge_items(keep_id: str, discard_id: str, reason: str = "") -> str:
-    """Collapse a duplicate: measurements and lineage are re-pointed at the kept
-    item, blanks are filled from the discarded one, which is then tombstoned."""
+    """Merge a duplicate into the kept item; the other is tombstoned.
+
+    Measurements and derivation links re-point at keep_id; blanks are filled from
+    discard_id.
+    """
     return get_service().merge_items(keep_id, discard_id, reason=reason)
 
 
 @mcp.tool()
 @_guard
 def export_data(directory: str = "") -> str:
-    """Write denormalised CSV views plus a SQLite mirror and manifest.json for
-    dashboards and other third-party consumers."""
+    """Write CSV views + SQLite mirror + manifest.json for dashboards."""
     return get_service().export(directory=directory)

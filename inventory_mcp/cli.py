@@ -101,7 +101,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     occ = sub.add_parser("occupancy", help="capacity report")
     occ.add_argument("container_id", nargs="?", default="")
-    occ.add_argument("--recursive", action="store_true")
+    occ.add_argument("--kind", default="", help="filter to one container kind")
     occ.set_defaults(func=_cmd_occupancy)
 
     schema_cmd = sub.add_parser("schema", help="print the schema reference")
@@ -297,7 +297,7 @@ def _cmd_ls(args) -> int:
             print(f"{c['container_id']:<14} {c['kind']:<12} {c['label']:<28} "
                   f"{fill:<14} {c['path']}")
         return 0
-    for it in svc.search_items(item_class=args.item_class, text=args.text):
+    for it in svc._matching_items(item_class=args.item_class, text=args.text):
         loc = it["location"]["path"] or "unlocated"
         pos = it["location"]["position"]
         print(f"{it['item_id']:<14} {it['class']:<10} {it['status']:<18} "
@@ -307,16 +307,14 @@ def _cmd_ls(args) -> int:
 
 def _cmd_occupancy(args) -> int:
     svc = Service.open(args.config)
-    rows = svc.occupancy(container_id=args.container_id, recursive=args.recursive)
+    rows = svc._occupancy_rows(container_id=args.container_id, kind=args.kind)
     for r in rows:
-        if r["grid"]:
+        if r["has_capacity"]:
             pct = f"{r['occupancy_pct']}%"
             detail = f"{r['occupied']:>4}/{r['capacity']:<5} free {r['free']:<5} {pct:<7}"
-            if not r["wells_resolved"]:
-                detail += f"  ({r['with_known_well']}/{r['occupied']} wells recorded)"
         else:
-            # No geometry: report what it holds rather than a fake percentage.
-            detail = (f"{r['occupied']:>4} item(s), {r['child_containers']} "
+            # No capacity recorded: report what it holds rather than a fake percentage.
+            detail = (f"{r['items_held']:>4} item(s), {r['child_containers']} "
                       f"container(s) inside")
         print(f"{r['container_id']:<14} {r['kind']:<12} {r['label']:<28} {detail}")
     return 0
