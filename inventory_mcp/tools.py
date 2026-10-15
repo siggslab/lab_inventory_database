@@ -4,9 +4,12 @@ Deliberately thin. There is no logic here -- argument marshalling, error
 formatting, JSON serialisation. Everything substantive lives in ``service.py``
 so that a dashboard importing it gets identical behaviour to the model.
 
-Tool descriptions carry the rules a caller needs (ids are generated, positions
-are optional, units must match the assay) because those are exactly the things
-that would otherwise come back as confusing rejections.
+Tool descriptions say what a tool is for, in a sentence. Parameter descriptions say
+how to call it. Rules that hold for every call (ids are generated here, positions
+are optional, capacity counts slots) live in ``INSTRUCTIONS``, where they are read
+once per session instead of once per tool load. Anything a wrong argument would
+trip is left to the refusals to say, because the server names the violated rule
+better than a description can.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp_types import Tool as MCPTool
 from pydantic import Field
 
-from . import __version__
+from . import __version__, schema
 from .config import Config
 from .service import Conflict, NotFound, Service, ServiceError, ValidationError
 
@@ -36,17 +39,31 @@ Conventions worth knowing before calling anything:
   search first. Human names and GML sample ids are mutable labels, not keys.
 - positions are a bonus. Most entries are recorded at box level only. An absent
   position does NOT mean the well is free.
-- measurements are immutable observations. Corrections append via
-  correct_measurement rather than editing a value. Every measurement names an
-  assay and a unit; the unit must match the assay's quantity.
+- capacity counts slots, one thing per slot -- a tube in a well, a box in a rack.
+  Figures are never added across container levels, so read a fill number with the
+  level it was asked for.
+- measurements are immutable observations; nothing edits a recorded value.
+  Recording again appends a newer reading rather than retracting the old one.
+  Every measurement names an assay and a unit; the unit must match the assay's
+  quantity. A reading goes in as value_num (numeric assay) or value_text
+  (qualitative one) and comes back as value: the figure as observed with its
+  unit, plus the same figure in the assay's canonical unit.
+- times are UTC to the minute, stored with a trailing Z. Send YYYY-MM-DDTHH:MM,
+  or spell the zone out as ...Z or ...+10:00 and it is folded into UTC; either way
+  the answer comes back with Z on it. A timestamp missing the marker predates it and
+  is UTC as well. A bare date is refused rather than guessed at, since readings are
+  ordered by minute. Plain dates -- collected_on, expires_on -- name no time of day
+  and carry no zone.
 - status is present / partially_consumed / consumed. A consumed item holds no
-  slot, so setting it clears the location.
-- writes validate before touching storage. If a call is refused, the message
-  lists every rule violated and nothing has been written.
-- container kinds: freezer fridge ln2_shipper shelf rack box bench room other.
-- run_query SQL sees the 12 tables (items, samples, reagents, kits, consumables,
-  containers, patients, projects, patient_projects, item_links, assays,
-  measurements) plus views items_wide and latest_measurements.
+  slot, so setting it clears the location and the well with it; nothing remembers
+  them. Marking an item present again therefore names a container to go back into.
+- enrolment is exact. A sample may only pair a participant with a project they are
+  enrolled in by name; the project tree organises work and never extends consent,
+  so a parent project covers none of its children.
+- writes validate before touching storage, so a refused call has written nothing.
+  A refusal that names entries is about the ones your call broke. One that says the
+  database is locked is about damage predating your call, often from hand edits to the
+  files: run doctor, then ask whoever made them before changing anything.
 """
 
 
@@ -111,6 +128,60 @@ def _dump(payload: Any) -> str:
     return json.dumps(payload, indent=2, default=str)
 
 
+def _param(description: str, vocabulary: tuple[str, ...] = ()) -> Any:
+    """Field info, optionally advertising a closed vocabulary in the schema.
+
+    The vocabulary is written out as ``enum`` while the argument stays a plain ``str``,
+    which puts the same list on the wire that a ``Literal`` would and keeps the refusal
+    in the service. A ``Literal`` mismatch is caught by pydantic before the tool runs, so
+    it reaches the model as ``Error executing tool x: 1 validation error`` -- the shape of
+    a crash, with a docs link, instead of the row and rule at fault.
+    """
+    return Field(description=description,
+                 json_schema_extra={"enum": list(vocabulary)} if vocabulary else None)
+
+
+def _record(result: Any, index: int = 0) -> dict:
+    """The row a write asks the caller to read back, without the commit envelope.
+
+    ``CommitResult.as_dict`` also carries the operation, the tables touched, a backup
+    path and any warnings. The first two restate what the caller just did and sometimes
+    misattribute it -- ``create_box`` reports ``create_container`` because it delegates --
+    the backup path names a server filesystem nobody here can open, and warnings stay
+    empty on every tool call, since only the CLI's ``enrol`` migration ever fills them.
+    """
+    records = getattr(result, "records", None) or []
+    row = records[index] if index < len(records) else {}
+    return row if isinstance(row, dict) else {}
+
+
+_LOCKED = (
+    "WRITE REFUSED — nothing was saved. Nothing in this call is at fault: the database is "
+    "locked by {n} violation(s) that were standing before it, most often the residue of "
+    "someone editing the files by hand. Run doctor for the failing tables and rows. Do not "
+    "repair them on your own initiative -- an entry that looks illegal may well be a "
+    "deliberate change -- so check with whoever edits these files first."
+)
+
+
+def _refusal(e: ValidationError) -> str:
+    """Name what the caller broke, or say plainly that they broke nothing.
+
+    Without this split a refusal against a damaged database handed over a list of rows the
+    caller never touched, which reads as permission to tidy them -- and tidying a human's
+    intentional edit back to its last server-written value destroys the edit silently.
+    """
+    if not e.introduced:
+        return _LOCKED.format(n=len(e.preexisting))
+    out = ("WRITE REFUSED — nothing was saved. This call would leave invalid:\n"
+           + "\n".join("  - " + str(v) for v in e.introduced))
+    if e.preexisting:
+        out += (f"\n\nIt also walked into {len(e.preexisting)} violation(s) that predate it and "
+                "block writes on their own account. Run doctor for those, and treat them as "
+                "someone else's business until you know otherwise.")
+    return out
+
+
 def _guard(fn):
     """Turn service exceptions into readable tool errors.
 
@@ -128,9 +199,7 @@ def _guard(fn):
                 return _dump(result.as_dict())
             return _dump(result)
         except ValidationError as e:
-            return "WRITE REFUSED — nothing was saved.\n" + "\n".join(
-                "  - " + str(v) for v in e.violations
-            )
+            return _refusal(e)
         except (NotFound, Conflict) as e:
             return f"{type(e).__name__}: {e}"
         except ServiceError as e:
@@ -154,37 +223,87 @@ def doctor() -> str:
     return get_service().doctor()
 
 
+# search_items and count_items take the same filters, so they describe them from
+# the same strings -- a divergence here would read as a difference in meaning.
+_P_NO_PROJECT = Annotated[bool, Field(
+    description="Only samples with no project recorded; supplies carry no project, so "
+                "this implies item_class=sample.")]
+_P_NO_PATIENT = Annotated[bool, Field(
+    description="Only samples with no participant recorded; this implies "
+                "item_class=sample.")]
+_P_RECEIVED_SINCE = Annotated[str, Field(
+    description="Keep samples received on or after this ISO date; accepts a bare "
+                "YYYY or YYYY-MM too. Undated samples never match.")]
+_P_RECEIVED_BEFORE = Annotated[str, Field(
+    description="Keep samples received strictly before this ISO date; accepts a bare "
+                "YYYY or YYYY-MM too. Undated samples never match.")]
+_P_EXPIRES_BEFORE = Annotated[str, Field(
+    description="Keep supplies expiring strictly before this ISO date. Supplies with "
+                "no expiry recorded never match.")]
+_P_MEASURED_AFTER = Annotated[str, Field(
+    description="Only items with at least one reading recorded on or after this ISO "
+                "date or timestamp.")]
+
+
 @mcp.tool()
 @_guard
 def search_items(
-    text: str = "",
-    item_class: str = "",
-    status: str = "",
-    project_id: str = "",
-    patient_id: str = "",
-    container_id: str = "",
-    sample_type: str = "",
-    gml_id: str = "",
-    unlocated: bool = False,
-    include_deleted: bool = False,
-    has_position: Optional[bool] = None,
+    text: Annotated[str, Field(
+        description="Any part of a name, note, handler, GML id, source material or "
+                    "container label; the rows do not show most of those.")] = "",
+    item_class: Annotated[str, Field(
+        description="sample | reagent | kit | consumable.")] = "",
+    status: Annotated[str, Field(
+        description="present | partially_consumed | consumed.")] = "",
+    project_id: Annotated[str, Field(
+        description="Samples attached to this project; see search_projects.")] = "",
+    patient_id: Annotated[str, Field(
+        description="Samples belonging to this participant; see search_patients.")] = "",
+    container_id: Annotated[str, Field(
+        description="Items sitting directly in this container; get_contents lists "
+                    "what is in one container without filtering.")] = "",
+    sample_type: Annotated[str, Field(
+        description="dna | rna | plasma | pbmc | whole_blood ... samples only.")] = "",
+    gml_id: Annotated[str, Field(
+        description="Exact GML label, case-insensitive; a label, not a key.")] = "",
+    unlocated: Annotated[bool, Field(
+        description="No container recorded. Consumed tubes hold no slot, so add "
+                    "status=present to find genuinely lost material.")] = False,
+    include_deleted: Annotated[bool, Field(
+        description="Include tombstoned rows, which stay for provenance.")] = False,
+    has_position: Annotated[Optional[bool], Field(
+        description="True for a well recorded, False for none recorded. Most entries "
+                    "are box-level, so False is normal rather than odd.")] = None,
+    no_project: _P_NO_PROJECT = False,
+    no_patient: _P_NO_PATIENT = False,
+    received_since: _P_RECEIVED_SINCE = "",
+    received_before: _P_RECEIVED_BEFORE = "",
+    expires_before: _P_EXPIRES_BEFORE = "",
+    measured_after: _P_MEASURED_AFTER = "",
+    sort: Annotated[str, Field(
+        description="name | status | class | received_on | updated_at, prefixed with "
+                    "- for descending. Empty means by name.")] = "",
+    limit: Annotated[int, Field(
+        description="Stop after this many rows; 0 means every match, so name a number "
+                    "to ask for the top N.")] = 0,
+    offset: Annotated[int, Field(
+        description="Rows to skip, so a limit can be paged past. The answer carries "
+                    "'matched' (what the filters found in total) and 'truncated' (another "
+                    "page exists): hold the filters still and step offset by the page size "
+                    "until truncated comes back false.")] = 0,
 ) -> str:
-    """Search for stored items (e.g. samples, reagents) and retrieve id.
-
-    Rows are id, name, status, location label and human labels only;
-    get_item returns the rest, including related-object ids and well position.
-    Filters combine; an empty filter is unconstrained.
-    class: sample|reagent|kit|consumable. status: present|partially_consumed|consumed.
-    text also matches notes and handler, which the rows do not show.
-    Pass unlocated=True for no container recorded -- includes consumed items,
-    so pair with status=present to find genuinely lost material.
-    For what is inside a container use get_contents instead.
+    """Find stored items -- samples, reagents, kits, consumables -- by any
+    combination of these filters.
     """
     return get_service().search_items(
         text=text, item_class=item_class, status=status, project_id=project_id,
         patient_id=patient_id, container_id=container_id,
         sample_type=sample_type, gml_id=gml_id,
         unlocated=unlocated, include_deleted=include_deleted, has_position=has_position,
+        no_project=no_project, no_patient=no_patient,
+        received_since=received_since, received_before=received_before,
+        expires_before=expires_before, measured_after=measured_after,
+        sort=sort, limit=limit, offset=offset,
     )
 
 
@@ -205,76 +324,87 @@ def get_item(
 
 @mcp.tool()
 @_guard
-def list_containers(kind: str = "", parent_id: str = "") -> str:
-    """List containers with capacity and occupancy, optionally by kind/parent.
-
-    kinds: freezer fridge ln2_shipper shelf rack box bench room other.
-    """
-    return get_service().list_containers(kind=kind, parent_id=parent_id)
+def search_containers(
+    query: Annotated[str, Field(
+        description="Container id, or any part of a label, case-insensitive. Cannot "
+                    "be blank; 'ctr_' matches every id.")],
+    kind: Annotated[str, Field(
+        description="Only this container kind.")] = "",
+    within_id: Annotated[str, Field(
+        description="Only containers under this container, at any depth; it is not "
+                    "listed among its own results.")] = "",
+    limit: Annotated[int, Field(
+        description="Maximum rows; 'truncated' says whether more exist.")] = 20,
+    offset: Annotated[int, Field(
+        description="Rows to skip, to page past a limit. Keep the other arguments still "
+                    "and step offset by 'limit' while 'truncated' is true; 'matched' is how "
+                    "many matched in total, whatever page is showing.")] = 0,
+) -> str:
+    """Find storage locations by id or label."""
+    return get_service().search_containers(
+        query=query, kind=kind, within_id=within_id, limit=limit, offset=offset
+    )
 
 
 @mcp.tool()
 @_guard
-def container_tree(root_id: str = "") -> str:
-    """Storage hierarchy as nested nodes with capacity and occupancy."""
-    return get_service().container_tree(root_id=root_id)
-
-
-@mcp.tool()
-@_guard
-def get_contents(container_id: str, recursive: bool = False) -> str:
-    """What is stored in a container: lean rows plus free space at the top.
-
-    Pass recursive=True to include items in containers nested below, each row
-    naming its container. Consumed items have no location, so appear nowhere.
-    """
-    return get_service().contents(container_id=container_id, recursive=recursive)
+def get_contents(
+    container_id: Annotated[str, Field(
+        description="Container id as returned by search_containers.")],
+) -> str:
+    """What is stored directly inside one container, nested containers included."""
+    return get_service().get_contents(container_id=container_id)
 
 
 @mcp.tool()
 @_guard
 def get_occupancy(
     container_id: Annotated[str, Field(
-        description="Container id as returned by list_containers or container_tree.")],
+        description="Container id as returned by search_containers.")],
     kind: Annotated[str, Field(
-        description="Report at this level: a container kind (box, rack, shelf...) "
-                    "or an item class (sample, reagent, kit, consumable). Omit for "
-                    "the containers nested directly inside.")] = "",
+        description="Level to report at: a container kind (box, rack, shelf...) or an "
+                    "item class (sample, reagent, kit, consumable). Omit for the "
+                    "containers directly inside; name the target's own kind to measure "
+                    "the target. Figures are never summed across levels.")] = "",
 ) -> str:
-    """How full one container is, at the granularity you ask for.
-
-    Rows are the things of that kind inside it, each with its own figures; summary
-    measures the containers those rows live in -- so asking about boxes counts the
-    slots their rack offers, asking about samples counts wells. Ask a container about
-    its own kind and it measures itself. Slots are never added across tiers, and no
-    figure here depends on a recorded well position.
-    """
+    """How full one container is, at the granularity you ask for."""
     return get_service().get_occupancy(container_id=container_id, kind=kind)
 
 
 @mcp.tool()
 @_guard
 def count_items(
-    text: str = "",
-    item_class: str = "",
-    status: str = "",
-    project_id: str = "",
-    patient_id: str = "",
-    container_id: str = "",
-    sample_type: str = "",
-    unlocated: bool = False,
+    text: Annotated[str, Field(
+        description="Matches names, notes, handlers, GML ids, source material and "
+                    "container labels.")] = "",
+    item_class: Annotated[str, Field(
+        description="sample | reagent | kit | consumable.")] = "",
+    status: Annotated[str, Field(
+        description="present | partially_consumed | consumed.")] = "",
+    project_id: Annotated[str, Field(description="Samples attached to this project.")] = "",
+    patient_id: Annotated[str, Field(description="Samples belonging to this participant.")] = "",
+    container_id: Annotated[str, Field(description="Items sitting directly in this container.")] = "",
+    sample_type: Annotated[str, Field(description="Samples of this type only.")] = "",
+    unlocated: Annotated[bool, Field(
+        description="No container recorded; consumed tubes count as unlocated, so add "
+                    "status=present for lost material.")] = False,
+    no_project: _P_NO_PROJECT = False,
+    no_patient: _P_NO_PATIENT = False,
+    received_since: _P_RECEIVED_SINCE = "",
+    received_before: _P_RECEIVED_BEFORE = "",
+    expires_before: _P_EXPIRES_BEFORE = "",
+    measured_after: _P_MEASURED_AFTER = "",
 ) -> str:
-    """Answer "how many items match?" without returning the rows.
-
-    Same filters as search_items minus gml_id/include_deleted/has_position.
-    unlocated counts include consumed tubes; add status=present for lost material.
-    """
+    """How many items match these filters, counted here instead of by counting rows."""
     svc = get_service()
     return {
         "count": svc.count_items(
             text=text, item_class=item_class, status=status, project_id=project_id,
             patient_id=patient_id, container_id=container_id,
             sample_type=sample_type, unlocated=unlocated,
+            no_project=no_project, no_patient=no_patient,
+            received_since=received_since, received_before=received_before,
+            expires_before=expires_before, measured_after=measured_after,
         )
     }
 
@@ -283,44 +413,82 @@ def count_items(
 @_guard
 def search_patients(
     query: Annotated[str, Field(
-        description="Participant id, or any part of a label, matched case-insensitively.")],
-    project_id: str = "",
-    limit: int = 20,
+        description="Participant id, or any part of a label, case-insensitive. "
+                    "Cannot be blank; 'pat_' matches every id.")],
+    project_id: Annotated[str, Field(
+        description="Count only this project's samples; the participants listed "
+                    "are unchanged.")] = "",
+    limit: Annotated[int, Field(
+        description="Maximum rows; 'truncated' says whether more exist.")] = 20,
+    offset: Annotated[int, Field(
+        description="Rows to skip, to page past a limit. Keep the other arguments still "
+                    "and step offset by 'limit' while 'truncated' is true; 'matched' is how "
+                    "many matched in total, whatever page is showing.")] = 0,
 ) -> str:
-    """Find participants by id or label, with how many samples each holds.
-
-    Rows come back heaviest first and stop at limit, with matched and truncated
-    reported rather than left to be guessed. A participant with nothing stored returns
-    total 0, which is the difference between "not enrolled yet" and "no such person".
-    Only samples carry a participant, so supplies are never counted; project_id narrows
-    the counts without narrowing who is listed. Beside the rows, "unassigned" counts
-    samples held with no participant recorded. No blank query: "pat_" matches every id,
-    which is how you ask for the whole cohort.
-    """
-    return get_service().search_patients(query=query, project_id=project_id, limit=limit)
+    """Find participants by id or label, with how many samples each holds."""
+    return get_service().search_patients(query=query, project_id=project_id,
+                                         limit=limit, offset=offset)
 
 
 @mcp.tool()
 @_guard
-def rollup_by_project(patient_id: str = "", item_class: str = "") -> str:
-    """Counts per project, split by status."""
-    return get_service().rollup_by_project(patient_id=patient_id, item_class=item_class)
+def get_patient(
+    patient_id: Annotated[str, Field(
+        description="Participant id as returned by search_patients; never invented.")],
+) -> str:
+    """One participant in full: the record as enrolled, their projects, what we hold."""
+    return get_service().get_patient(patient_id)
+
+
+@mcp.tool()
+@_guard
+def list_assays() -> str:
+    """Every measurement kind this lab records, and the unit each one is in."""
+    return get_service().list_assays()
+
+
+@mcp.tool()
+@_guard
+def search_projects(
+    query: Annotated[str, Field(
+        description="Project id, or any part of a name, case-insensitive. "
+                    "Cannot be blank; 'prj_' matches every id.")],
+    limit: Annotated[int, Field(
+        description="Maximum rows; 'truncated' says whether more exist.")] = 20,
+    offset: Annotated[int, Field(
+        description="Rows to skip, to page past a limit. Keep the other arguments still "
+                    "and step offset by 'limit' while 'truncated' is true; 'matched' is how "
+                    "many matched in total, whatever page is showing.")] = 0,
+) -> str:
+    """Find projects by id or name, with participant and sample counts."""
+    return get_service().search_projects(query=query, limit=limit, offset=offset)
 
 
 @mcp.tool()
 @_guard
 def get_measurements(
     item_id: Annotated[str, Field(
-        description="Item id as returned by search_items or get_contents.")],
+        description="The item whose readings you want, from search_items or get_contents. "
+                    "One item at a time; there is no all-items mode here.")],
     assay: Annotated[str, Field(
-        description="The assay's short code, e.g. qubit_dsdna -- what create_assay "
-                    "registers, not the assay's display name.")] = "",
+        description="Narrow to one assay by its short code, like qubit_dsdna -- what "
+                    "create_assay registers and list_assays lists, not the display name. A "
+                    "code that doesn't exist is refused rather than read as no filter.")] = "",
     include_historical: Annotated[bool, Field(
-        description="Include measurements replaced with more recent measurements")] = False,
+        description="The whole series instead of its endpoint: every earlier reading for the "
+                    "assay, including the ones a later reading retired. Off means the newest "
+                    "per assay.")] = False,
     include_superseded: Annotated[bool, Field(
-        description="Include measurements replaced with more accurate measurements")] = False,
+        description="Adds the retired readings -- taken over by a later one, or corrected -- "
+                    "to the newest-per-assay answer. How you see what the current value "
+                    "replaced without pulling the whole series. Retired rows are never "
+                    "eligible to be the current one.")] = False,
 ) -> str:
-    """Returns current and (optionally) historical measurements for a given item"""
+    """What an item has been measured at, one reading per assay.
+
+    The only view of measurement history on the surface: get_item shows where the numbers
+    stand now, this shows what happened to them.
+    """
     if not item_id.strip():
         raise ServiceError("item_id is required; there is no all-items mode here")
     return get_service().get_measurements(
@@ -346,283 +514,472 @@ def get_linked_items(
     return get_service().get_linked_items(item_id, direction=direction)
 
 
-@mcp.tool()
-@_guard
-def run_query(sql: str, limit: int = 500) -> str:
-    """Read-only SQL (select/with only) over the loaded tables and views.
-
-    Table and view names are listed in the server instructions. Use for
-    aggregate questions the fixed tools cannot answer.
-    """
-    return get_service().run_query(sql, limit=limit)
-
-
 # ---------------------------------------------------------------------------
 # writes
 # ---------------------------------------------------------------------------
 
 
+def _container_receipt(row: dict) -> dict:
+    """A container as it now stands, minus what the caller just typed at it."""
+    receipt = {"container_id": row.get("container_id", ""), "kind": row.get("kind", ""),
+               "label": row.get("label", ""), "path": row.get("path", ""),
+               "capacity": row.get("capacity", "")}
+    if row.get("geometry"):
+        receipt["geometry"] = row["geometry"]
+    return receipt
+
+
+def _item_receipt(row: dict) -> dict:
+    """An item as it now stands; everything else about it is ``get_item``'s to say."""
+    return {"item_id": row.get("item_id", ""), "class": row.get("class", ""),
+            "name": row.get("name", ""), "status": row.get("status", "")}
+
+
 @mcp.tool()
 @_guard
 def create_container(
-    kind: str,
-    label: str,
-    parent_id: str = "",
-    rows: str = "",
-    cols: str = "",
-    row_labels: str = "",
-    col_labels: str = "",
-    capacity: str = "",
-    notes: str = "",
+    kind: Annotated[str, _param("What sort of place this is.", schema.CONTAINER_KINDS)],
+    label: Annotated[str, _param(
+        "What people call it, like '-80 Freezer #7085' or 'Rack 3'. Free text, changeable "
+        "later with edit_name, and never a key.")],
+    parent_id: Annotated[str, _param(
+        "The container holding this one, from search_containers; its id decides the path. "
+        "Leave it empty only for a freezer or a room -- anything else that is not inside "
+        "something has nowhere to be found.")] = "",
+    capacity: Annotated[Optional[int], _param(
+        "How many things fit here, where a nested box counts as one thing. Set it on "
+        "furniture that holds boxes, and on a box whose grid nobody wrote down. Leaving it "
+        "out means unrecorded, which leaves occupancy uncapped rather than wrong.")] = None,
+    notes: Annotated[str, _param(
+        "Anything worth knowing about the place itself, like who owns it or what it is reserved for.")] = "",
 ) -> str:
-    """Add a storage location (freezer, shelf, rack, box, bench, room...).
+    """Add a storage location to the tree: a freezer, shelf, rack, fridge, bench or room.
 
-    ``capacity`` is how many things fit here -- tubes or nested containers, one slot
-    each. A gridded box gets it from rows*cols, so leave it empty there; set it on
-    furniture that holds boxes, and on boxes recorded without a grid. rows/cols
-    describe wells, so they belong on a box and nowhere else.
+    A gridded box belongs to create_box; this makes the furniture around it, and the box
+    whose grid nobody ever recorded.
     """
-    return get_service().create_container(
-        kind=kind, label=label, parent_id=parent_id, rows=rows, cols=cols,
-        row_labels=row_labels, col_labels=col_labels,
-        capacity=capacity, notes=notes,
-    )
+    result = get_service().create_container(kind=kind, label=label, parent_id=parent_id,
+                                            capacity=capacity, notes=notes)
+    return _container_receipt(_record(result))
 
 
 @mcp.tool()
 @_guard
-def create_box(label: str, rows: int, cols: int, parent_id: str, notes: str = "") -> str:
-    """Add a grid box to a rack/shelf; any geometry (10x10, 9x9, 12x8)."""
-    return get_service().create_box(label=label, rows=rows, cols=cols,
-                                    parent_id=parent_id, notes=notes)
+def create_box(
+    label: Annotated[str, _param(
+        "What the box is called, like 'VEXAS DNA Box 1'. Changeable with edit_name, never a key.")],
+    rows: Annotated[int, _param(
+        "Rows in the grid. Wells read row-then-column, so nine rows and ten columns run A1 "
+        "to J9.")],
+    cols: Annotated[int, _param(
+        "Columns in the grid. Their product with rows is how many tubes fit, so the 82nd tube "
+        "in a 9x9 box is refused rather than filed in a well that does not exist.")],
+    parent_id: Annotated[str, _param(
+        "The rack or shelf it sits in, from search_containers. Required: a box takes a slot "
+        "in something, and one inside nothing can be neither found nor counted.")],
+    row_labels: Annotated[str, _param(
+        "Row names when the grid does not run A, B, C -- usually a box that skips I so it "
+        "cannot be misread as 1: 'A,B,C,D,E,F,G,H,J,K'. Separated by commas. Give exactly as "
+        "many names as rows, or they are dropped in favour of A, B, C.")] = "",
+    col_labels: Annotated[str, _param(
+        "Column names for a grid not numbered 1..cols. Same separator and same count rule.")] = "",
+    notes: Annotated[str, _param("Anything worth knowing about the box itself.")] = "",
+) -> str:
+    """Add a gridded box to a rack or shelf, at any geometry: 9x9, 10x10, 12x8."""
+    result = get_service().create_box(label=label, rows=rows, cols=cols, parent_id=parent_id,
+                                      row_labels=row_labels, col_labels=col_labels, notes=notes)
+    return _container_receipt(_record(result))
 
 
 @mcp.tool()
 @_guard
 def create_sample(
-    name: str,
-    sample_type: str,
-    location_id: str = "",
-    position: str = "",
-    gml_id: str = "",
-    patient_id: str = "",
-    project_id: str = "",
-    source_material: str = "",
-    collected_on: str = "",
-    received_on: str = "",
-    processed_on: str = "",
-    handler: str = "",
-    notes: str = "",
+    name: Annotated[str, _param(
+        "What the tube is called, like 'PBMC-041-01'. Changeable with edit_name, never a key.")],
+    sample_type: Annotated[str, _param("What is in the tube.", schema.SAMPLE_TYPES)],
+    location_id: Annotated[str, _param(
+        "The box or shelf it goes in, from search_containers. Leaving it out is an honest "
+        "answer when nobody knows where the tube is, not an error.")] = "",
+    position: Annotated[str, _param(
+        "The well, like 'C4'. Optional: most tubes are filed at box level only, and an empty "
+        "position never means the well is free. Refused if the box's grid has no such well.")] = "",
+    gml_id: Annotated[str, _param(
+        "The code the sequencing facility knows it by, like 'GML001631'. A label, not a key.")] = "",
+    patient_id: Annotated[str, _param(
+        "Whom it came from -- pat_ id from search_patients. Only pairs with a project that "
+        "participant is enrolled in, so name both or neither.")] = "",
+    project_id: Annotated[str, _param(
+        "Which project it belongs to -- prj_ id from search_projects. Enrolment is exact: it "
+        "has to be listed for that participant, not merely an ancestor of something that is.")] = "",
+    source_material: Annotated[str, _param(
+        "Where in the body it came from, like 'whole blood' or 'buffy coat'.")] = "",
+    collected_on: Annotated[str, _param("Taken from the donor on this date, YYYY-MM-DD.")] = "",
+    received_on: Annotated[str, _param("Arrived in the lab on this date, YYYY-MM-DD.")] = "",
+    processed_on: Annotated[str, _param("Run through the pipeline on this date, YYYY-MM-DD.")] = "",
+    handler: Annotated[str, _param(
+        "Who is holding it. Blank records the account this server writes as, which is rarely "
+        "a person.")] = "",
+    notes: Annotated[str, _param("Anything worth keeping about the tube.")] = "",
 ) -> str:
-    """Register a physical tube. sample_type required; dates YYYY-MM-DD.
-
-    Patient+project, if both given, must already be paired via
-    assign_patient_project. Omitting location_id is an honest answer when the
-    whereabouts are unknown, not an error.
-    """
-    return get_service().create_sample(
+    """Register a physical tube of biological material."""
+    result = get_service().create_sample(
         name=name, sample_type=sample_type, location_id=location_id, position=position,
         gml_id=gml_id, patient_id=patient_id, project_id=project_id,
         source_material=source_material, collected_on=collected_on,
         received_on=received_on, processed_on=processed_on, handler=handler, notes=notes,
     )
+    return _item_receipt(_record(result))
 
 
 @mcp.tool()
 @_guard
 def create_supply(
-    item_class: str,
-    name: str,
-    location_id: str = "",
-    price: str = "",
-    expires_on: str = "",
-    storage_requirements: str = "",
-    initial_quantity: str = "",
-    quantity_assay: str = "",
-    quantity_unit: str = "",
-    notes: str = "",
+    item_class: Annotated[str, _param(
+        "Which sort of supply. A tube of material is not one; that is create_sample.",
+        schema.SUPPLY_CLASSES)],
+    name: Annotated[str, _param(
+        "What it is called, like 'Proteinase K' or 'Qiagen DNeasy kit'.")],
+    location_id: Annotated[str, _param(
+        "Where it is kept, from search_containers. Empty means unrecorded, which is legal and "
+        "findable with search_items(unlocated=true).")] = "",
+    position: Annotated[str, _param(
+        "The well, only meaningful inside a gridded box -- a bottle on a shelf has no well.")] = "",
+    price: Annotated[str, _param("What it cost, as digits like '88.50'. No currency sign; "
+                                 "there is no column for which currency.")] = "",
+    expires_on: Annotated[str, _param("Expires on this date, YYYY-MM-DD. Find them with "
+                                      "search_items(expires_before=...).")] = "",
+    storage_requirements: Annotated[str, _param(
+        "How it is stored, like '2-8 C' or 'protect from light'.")] = "",
+    initial_quantity: Annotated[str, _param(
+        "How much there is, as digits like '15'. Needs quantity_assay and quantity_unit with "
+        "it: an amount that names no kind of measurement cannot be compared with a later reading.")] = "",
+    quantity_assay: Annotated[str, _param(
+        "Which assay measures what is left, from list_assays -- reagent_volume for a bottle, "
+        "kit_uses_remaining for a kit. Later readings append under the same assay.")] = "",
+    quantity_unit: Annotated[str, _param(
+        "Unit of initial_quantity, checked against that assay's quantity: ml for a volume, "
+        "not ul_of_a_volume.")] = "",
+    quantity_measured_on: Annotated[str, _param(
+        "When the opening amount was true: YYYY-MM-DDTHH:MM in UTC, like any other reading "
+        "-- the opening amount is one, and it is stored with a trailing Z. Blank means "
+        "now.")] = "",
+    handler: Annotated[str, _param(
+        "Who looks after it. Blank records the account this server writes as.")] = "",
+    notes: Annotated[str, _param("Anything worth keeping about it.")] = "",
 ) -> str:
-    """Register a reagent, kit or consumable; item_class picks which.
-
-    Quantity is a measurement, not a column: pass initial_quantity with
-    quantity_assay (e.g. reagent_volume); later readings just append.
-    """
-    return get_service().create_supply(
-        item_class=item_class, name=name, location_id=location_id, price=price,
-        expires_on=expires_on, storage_requirements=storage_requirements,
-        initial_quantity=initial_quantity, quantity_assay=quantity_assay,
-        quantity_unit=quantity_unit, notes=notes,
+    """Register a reagent, kit or consumable."""
+    result = get_service().create_supply(
+        item_class=item_class, name=name, location_id=location_id, position=position,
+        price=price, expires_on=expires_on, storage_requirements=storage_requirements,
+        handler=handler, notes=notes, initial_quantity=initial_quantity,
+        quantity_assay=quantity_assay, quantity_unit=quantity_unit,
+        quantity_measured_on=quantity_measured_on,
     )
+    row = _record(result)
+    receipt = _item_receipt(row)
+    opening = (row.get("latest_measurements") or [{}])[0]
+    if initial_quantity != "" and opening:
+        receipt["opening_reading"] = {k: opening.get(k, "") for k in
+                                      ("assay", "value", "unit", "canonical", "measured_on")}
+    return receipt
 
 
 @mcp.tool()
 @_guard
-def move_item(
-    item_id: str,
-    location_id: Optional[str] = None,
-    position: Optional[str] = None,
-    clear_location: bool = False,
+def move(
+    id: Annotated[str, Field(
+        description="The thing being moved: an item (smp_, rgt_, kit_, csm_) or a "
+                    "container (ctr_). Never invented -- search for it first.")],
+    target_id: Annotated[str, Field(
+        description="Container to move it into. It takes one slot whatever it is, so a "
+                    "box fills a rack position the way a tube fills a well; refused when "
+                    "the target has no free slot.")],
+    position: Annotated[Optional[str], Field(
+        description="Well inside the target, like 'B7'. Items only. Optional: most "
+                    "entries are filed at box level. Omitting it keeps the old well when "
+                    "the container is unchanged and drops it otherwise, since a well label "
+                    "means different tubes in differently-shaped boxes. '' clears one.")] = None,
 ) -> str:
-    """Relocate an item. Changing containers drops the old well position.
-
-    Refuses if the target well is claimed; clear_location empties the slot.
-    """
-    return get_service().move_item(
-        item_id=item_id, location_id=location_id, position=position,
-        clear_location=clear_location,
-    )
+    """Put an item or a container inside another container."""
+    return get_service().move(object_id=id, target_id=target_id, position=position)
 
 
 @mcp.tool()
 @_guard
-def set_status(item_id: str, status: str, allow_backwards: bool = False) -> str:
-    """Set present | partially_consumed | consumed; consuming clears the slot.
+def set_status(
+    item_id: Annotated[str, Field(
+        description="The item being marked, like smp_zjpvxba2, from search_items. "
+                    "A GML label is not a key.")],
+    status: Annotated[Literal["present", "partially_consumed", "consumed"], Field(
+        description="consumed releases the slot: the container and the well are both "
+                    "cleared, and nothing remembers them.")],
+    location_id: Annotated[str, Field(
+        description="Container to file the item in, from search_containers. Required when "
+                    "the item holds no slot, which is always the case coming out of "
+                    "consumed. Refused with status=consumed, which holds nothing. Add a "
+                    "well afterwards with move.")] = "",
+) -> str:
+    """Mark an item present, partially_consumed, or consumed."""
+    result = get_service().set_status(item_id, status, location_id)
+    row = _record(result)
+    return {"item_id": row.get("item_id", ""), "name": row.get("name", ""),
+            "new_status": row.get("status", "")}
 
-    allow_backwards permits reversing, which usually flags a mis-record.
-    """
-    return get_service().set_status(item_id, status, allow_backwards=allow_backwards)
+
+# 'supersedes' is here rather than trimmed away because recording retires the reading
+# it overtook on its own: the caller has to be told which one, and this dict is the only
+# part of the reply a model reads.
+_MEASUREMENT_READBACK = ("measurement_id", "assay", "assay_name", "measured_on",
+                         "value", "unit", "canonical", "instrument", "notes", "supersedes")
 
 
 @mcp.tool()
 @_guard
 def record_measurement(
-    item_id: str,
-    assay: str,
-    value: str = "",
-    unit: str = "",
-    text: str = "",
-    measured_on: str = "",
-    handler: str = "",
-    instrument: str = "",
-    notes: str = "",
+    item_id: Annotated[str, Field(
+        description="The item being measured: smp_, rgt_, kit_ or csm_ id from "
+                    "search_items. A GML label is not a key.")],
+    assay: Annotated[str, Field(
+        description="Assay code or name as listed by list_assays, like qubit_dsdna. It "
+                    "decides whether the reading is numeric or qualitative.")],
+    value_num: Annotated[str, Field(
+        description="The number, as digits like '51.5'. For numeric assays; a qualitative "
+                    "assay takes value_text instead.")] = "",
+    unit: Annotated[str, Field(
+        description="Unit of value_num, checked against the assay's quantity -- ng/ul for a "
+                    "concentration, never ul. Required unless list_assays shows the assay "
+                    "as unitless.")] = "",
+    value_text: Annotated[str, Field(
+        description="The result in words, like 'no smearing'. For qualitative assays such "
+                    "as gel_qc; a numeric assay takes value_num instead.")] = "",
+    measured_on: Annotated[str, Field(
+        description="When the reading was taken: YYYY-MM-DDTHH:MM in UTC, or with its zone "
+                    "spelled out as ...Z or ...+10:00 -- it comes back as UTC with a trailing "
+                    "Z either way. A bare date is refused rather than guessed at, since "
+                    "readings are ordered by minute. Blank means now.")] = "",
+    handler: Annotated[str, Field(
+        description="Who took the reading; blank means the account this server writes as.")] = "",
+    instrument: Annotated[str, Field(
+        description="What the reading came off, free text like 'Qubit 4'.")] = "",
+    supersedes: Annotated[str, Field(
+        description="Name the reading you are correcting, by its measurement_id from "
+                    "get_measurements, when the earlier value was wrong rather than "
+                    "merely older. Leave blank and the current reading for this item and "
+                    "assay is retired automatically; the reply says which one. Blank with "
+                    "nothing to retire -- a first reading -- leaves it empty.")] = "",
+    notes: Annotated[str, Field(
+        description="Anything worth keeping about this reading.")] = "",
 ) -> str:
-    """Append an observation. Numeric: value+unit. Textual assays: text.
+    """Append an observation to an item; readings are added, never edited.
 
-    Units are checked against the assay's quantity, so a concentration cannot
-    be recorded in microlitres.
+    The reading this one takes over from comes back as 'supersedes', so the retired value
+    stays in the table and out of the answer. get_measurements with include_historical
+    shows the whole series.
     """
-    return get_service().record_measurement(
-        item_id=item_id, assay=assay, value=value, unit=unit, text=text,
-        measured_on=measured_on, handler=handler, instrument=instrument, notes=notes,
+    result = get_service().record_measurement(
+        item_id=item_id, assay=assay, value_num=value_num, unit=unit, value_text=value_text,
+        measured_on=measured_on, handler=handler, instrument=instrument,
+        supersedes=supersedes, notes=notes,
     )
+    row = _record(result)
+    return {k: row.get(k, "") for k in _MEASUREMENT_READBACK}
+
+
+def _entry_kind(row: dict) -> str:
+    """What an entry is called, from the row that was just written."""
+    if row.get("class"):
+        return row["class"]
+    for key, noun in (("container_id", "container"), ("patient_id", "patient"),
+                      ("project_id", "project"), ("assay_id", "assay")):
+        if row.get(key):
+            return noun
+    return ""
 
 
 @mcp.tool()
 @_guard
-def correct_measurement(
-    measurement_id: str,
-    value: str = "",
-    unit: str = "",
-    text: str = "",
-    measured_on: str = "",
-    instrument: str = "",
-    notes: str = "",
+def edit_name(
+    id: Annotated[str, Field(
+        description="Any entry's id -- smp_, rgt_, kit_ or csm_ for an item, ctr_ container, "
+                    "pat_ participant, prj_ project, asy_ assay. The id decides what gets "
+                    "renamed, so there is nothing else to declare.")],
+    name: Annotated[str, Field(
+        description="The new name, replacing the old one entirely. Names and labels are free "
+                    "to change and are never keys. Not blank; a GML code is edited with "
+                    "edit_data, not here.")],
 ) -> str:
-    """Append a correction; the original is marked superseded, never edited."""
-    changes = {
-        k: v
-        for k, v in {
-            "value": value, "unit": unit, "text": text, "measured_on": measured_on,
-            "instrument": instrument, "notes": notes,
-        }.items()
-        if v != ""
-    }
-    return get_service().correct_measurement(measurement_id, **changes)
+    """Change what an entry is called: its name, or its label for a box or participant."""
+    result = get_service().edit_name(id, name)
+    row = _record(result)
+    return {"id": id.strip(), "kind": _entry_kind(row),
+            "name": row.get("name") or row.get("label") or ""}
 
 
 @mcp.tool()
 @_guard
-def update_fields(
-    table: str,
-    record_id: str,
-    notes: Optional[str] = None,
-    handler: Optional[str] = None,
-    label: Optional[str] = None,
-    name: Optional[str] = None,
-    storage_requirements: Optional[str] = None,
-    expires_on: Optional[str] = None,
-    price: Optional[str] = None,
-    description: Optional[str] = None,
-    source_material: Optional[str] = None,
-    collected_on: Optional[str] = None,
-    received_on: Optional[str] = None,
-    processed_on: Optional[str] = None,
-    gml_id: Optional[str] = None,
+def edit_notes(
+    id: Annotated[str, Field(
+        description="The entry's id: item, container, participant, project or assay.")],
+    notes: Annotated[str, Field(
+        description="Replaces whatever note is there rather than appending, so send the whole "
+                    "text you want kept. '' clears it. On a project this writes its "
+                    "description.")],
 ) -> str:
-    """Edit descriptive fields on any table. Ids/class/status/FKs: not here.
+    """Replace the free-text note on an entry."""
+    result = get_service().edit_notes(id, notes)
+    row = _record(result)
+    return {"id": id.strip(), "kind": _entry_kind(row),
+            "notes": row.get("notes") or row.get("description") or ""}
 
-    Those carry structural consequences and have their own operations. Omit a
-    field to leave it unchanged.
-    """
-    changes = {
-        k: ("" if v is None else v)
-        for k, v in {
-            "notes": notes, "handler": handler, "label": label, "name": name,
-            "storage_requirements": storage_requirements, "expires_on": expires_on,
-            "price": price, "description": description,
-            "source_material": source_material, "collected_on": collected_on,
-            "received_on": received_on, "processed_on": processed_on, "gml_id": gml_id,
-        }.items()
-        if v is not None
-    }
-    if not changes:
-        raise ServiceError("nothing to change")
-    return get_service().update_fields(table, record_id, **changes)
+
+_EDITABLE_FIELD = Literal["source_material", "collected_on", "received_on", "processed_on",
+                          "gml_id", "storage_requirements", "expires_on", "price", "handler"]
 
 
 @mcp.tool()
 @_guard
-def link_items(child_item_id: str, parent_item_id: str, role: str, notes: str = "") -> str:
-    """Record a derivation edge between two items.
-
-    role: aliquot_of | extracted_from | pooled_into | derived_from | other.
-    """
-    return get_service().link_items(child_item_id, parent_item_id, role, notes)
+def edit_data(
+    id: Annotated[str, Field(
+        description="The item's id (smp_, rgt_, kit_ or csm_) from search_items. What it is "
+                    "decides which fields it has, so the class is not something you pass.")],
+    field: Annotated[_EDITABLE_FIELD, Field(
+        description="Samples take source_material, collected_on, received_on, processed_on, "
+                    "gml_id. Reagents, kits and consumables take storage_requirements, "
+                    "expires_on, price. handler works on any item.")],
+    value: Annotated[str, Field(
+        description="The new value as text -- dates YYYY-MM-DD, prices as digits like '149.5'. "
+                    "'' clears the field.")],
+) -> str:
+    """Set one class-specific field on an item, like a collection date or a price."""
+    service = get_service()
+    result = service.edit_data(id, field, value)
+    row = _record(result)
+    return {"id": id.strip(), "kind": service.item_class(id), "field": field,
+            "value": row.get(field, "")}
 
 
 @mcp.tool()
 @_guard
-def create_patient(label: str, sex: str = "", dob: str = "", affected_status: str = "",
-                   gene: str = "", variant: str = "", protocol: str = "",
-                   consented_on: str = "", notes: str = "") -> str:
-    """Register a research participant."""
-    return get_service().create_patient(
-        label=label, sex=sex, dob=dob, affected_status=affected_status, gene=gene,
-        variant=variant, protocol=protocol, consented_on=consented_on, notes=notes,
+def link_items(
+    child_item_id: Annotated[str, _param(
+        "The item that was made -- the aliquot, the pool, the library. smp_, rgt_, kit_ or "
+        "csm_ id from search_items.")],
+    parent_item_id: Annotated[str, _param(
+        "What it was made from. Two ids name one edge, so a second link between the same pair "
+        "is refused as a duplicate whatever its role claims.")],
+    role: Annotated[str, _param("How they are related, read as child <role> parent.",
+                                schema.LINK_ROLES)],
+    notes: Annotated[str, _param("Anything worth keeping about the transfer.")] = "",
+) -> str:
+    """Record that one item was made from another."""
+    result = get_service().link_items(child_item_id, parent_item_id, role, notes)
+    row = _record(result)
+    return {k: row.get(k, "") for k in
+            ("link_id", "child_item_id", "parent_item_id", "role")}
+
+
+@mcp.tool()
+@_guard
+def create_patient(
+    label: Annotated[str, _param(
+        "The code everyone uses for the person, like 'P-041'. Changeable with edit_name, "
+        "never a key.")],
+    project_id: Annotated[str, _param(
+        "Their first project, enrolled in the same commit; prj_ id from search_projects. A "
+        "participant with no project has nowhere legal to file material, so neither is "
+        "written without the other. Further projects go through assign_patient_project.")],
+    sex: Annotated[str, _param("As recorded.", schema.SEXES)] = "",
+    dob: Annotated[str, _param("Date of birth, YYYY-MM-DD.")] = "",
+    affected_status: Annotated[str, _param(
+        "Whether they carry what the study is about.", schema.AFFECTED_STATUSES)] = "",
+    gene: Annotated[str, _param("Gene of interest, in symbol form like 'UBA1'.")] = "",
+    variant: Annotated[str, _param(
+        "The variant as people write it, like 'p.Val43Leu' or 'c.1285G>T'.")] = "",
+    protocol: Annotated[str, _param(
+        "The ethics/HREC protocol number the work sits under.")] = "",
+    consented_on: Annotated[str, _param("Date they gave consent, YYYY-MM-DD.")] = "",
+    notes: Annotated[str, _param("Anything worth keeping about the person.")] = "",
+) -> str:
+    """Register a research participant and enrol them in their first project."""
+    result = get_service().create_patient(
+        label=label, project_id=project_id, sex=sex, dob=dob, affected_status=affected_status,
+        gene=gene, variant=variant, protocol=protocol, consented_on=consented_on, notes=notes,
     )
+    patient, enrolment = _record(result), _record(result, 1)
+    return {"patient_id": patient.get("patient_id", ""), "label": patient.get("label", ""),
+            "project_id": enrolment.get("project_id", "")}
 
 
 @mcp.tool()
 @_guard
-def create_project(name: str, status: str = "active", parent_project_id: str = "",
-                   description: str = "") -> str:
+def create_project(
+    name: Annotated[str, _param(
+        "What the work is called, like 'VEXAS'. Changeable with edit_name, never a key.")],
+    status: Annotated[str, _param("Where the work stands.", schema.PROJECT_STATUSES)] = "active",
+    parent_project_id: Annotated[str, _param(
+        "Nest this project under another, prj_ id from search_projects. The tree organises the "
+        "work and extends nothing: being a child of a project somebody is enrolled in does not "
+        "enrol them in it.")] = "",
+    description: Annotated[str, _param(
+        "What it is about. Written later with edit_notes, which calls this field description.")] = "",
+) -> str:
     """Add a project, or a subproject by naming its parent."""
-    return get_service().create_project(
+    result = get_service().create_project(
         name=name, status=status, parent_project_id=parent_project_id,
         description=description,
     )
+    row = _record(result)
+    return {"project_id": row.get("project_id", ""), "name": row.get("name", ""),
+            "status": row.get("status", "")}
 
 
 @mcp.tool()
 @_guard
-def assign_patient_project(patient_id: str, project_id: str) -> str:
-    """Enrol a participant in a project. Required before a sample pairs them."""
-    return get_service().assign_patient_project(patient_id, project_id)
+def assign_patient_project(
+    patient_id: Annotated[str, Field(description="Participant's pat_ id; see search_patients.")],
+    project_id: Annotated[str, Field(
+        description="Project's prj_ id; see search_projects. Enrolment is exact: a sample may "
+                    "only name a project listed here, never a parent or a child of one.")],
+) -> str:
+    """Add another project to a participant; their first one comes from create_patient."""
+    row = _record(get_service().assign_patient_project(patient_id, project_id))
+    return {k: row.get(k, "") for k in ("patient_id", "project_id", "link_id")}
 
 
 @mcp.tool()
 @_guard
-def create_assay(code: str, name: str, quantity: str, canonical_unit: str,
-                 result_type: str = "numeric", method: str = "", notes: str = "") -> str:
+def create_assay(
+    code: Annotated[str, _param(
+        "The handle every other call uses -- record_measurement names assays by it. Lowercase "
+        "with underscores, like qubit_dsdna. One per code: defining the same code twice is "
+        "refused rather than silently splitting a lab's readings in two.")],
+    name: Annotated[str, _param("The longer name a person reads, like 'Qubit dsDNA HS'.")],
+    quantity: Annotated[str, _param(
+        "What is actually being measured. It decides which units a reading may carry: "
+        "concentration_mass takes ng/ul, volume takes ul.", schema.QUANTITIES)],
+    canonical_unit: Annotated[str, _param(
+        "The unit readings are compared in, like ng/ul. Another unit of the same quantity is "
+        "accepted and converted to this on read.")],
+    result_type: Annotated[str, _param(
+        "numeric takes a number and a unit; text carries words like 'no smearing' and no unit.",
+        schema.RESULT_TYPES)] = "numeric",
+    method: Annotated[str, _param(
+        "How it is measured, like 'Qubit 4, RNA HS kit'. Worth filling in -- it is how anyone "
+        "later tells two similar assays apart.")] = "",
+    notes: Annotated[str, _param("Anything worth keeping about the definition.")] = "",
+) -> str:
     """Define a kind of measurement: a quantity and its canonical unit.
 
-    Choose carefully -- readings are compared within an assay, and two methods
-    reporting ng/ul are not necessarily measuring the same thing.
+    Readings are compared within an assay, so two methods that both report ng/ul are not
+    necessarily measuring the same thing.
     """
-    return get_service().create_assay(
+    result = get_service().create_assay(
         code=code, name=name, quantity=quantity, canonical_unit=canonical_unit,
         result_type=result_type, method=method, notes=notes,
     )
+    row = _record(result)
+    return {k: row.get(k, "") for k in
+            ("assay_id", "code", "name", "quantity", "canonical_unit", "result_type")}
 
 
 # ---------------------------------------------------------------------------
@@ -632,35 +989,107 @@ def create_assay(code: str, name: str, quantity: str, canonical_unit: str,
 
 @mcp.tool()
 @_guard
-def delete_item(item_id: str, force: bool = False) -> str:
-    """Tombstone an item; the row stays for provenance.
+def delete_item(
+    item_id: Annotated[str, _param(
+        "The item to retire, from search_items. Nothing has to be dealt with first, and "
+        "nothing downstream is rewritten: measurements and derivation links keep pointing "
+        "here, and get_linked_items still shows a tube that no longer exists -- provenance "
+        "outlives the tube.")],
+) -> str:
+    """Retire an item. The row stays as a tombstone, so provenance survives."""
+    row = _record(get_service().delete_item(item_id))
+    return {"item_id": row.get("item_id", ""), "deleted_at": row.get("deleted_at", "")}
 
-    Non-consumed items need force=true, since discarding material that still
-    exists is a different claim.
+
+@mcp.tool()
+@_guard
+def delete_container(
+    container_id: Annotated[str, _param(
+        "The place to remove, from search_containers. Refused while it still holds items or "
+        "nested containers, in which case the refusal lists what is inside by id so it can be "
+        "emptied and the delete retried.")],
+) -> str:
+    """Remove a storage location, once it holds nothing."""
+    row = _record(get_service().delete_container(container_id))
+    return {"container_id": row.get("deleted_container", "")}
+
+
+@mcp.tool()
+@_guard
+def delete_patient(
+    patient_id: Annotated[str, _param(
+        "Participant's pat_ id, from search_patients. Nothing needs clearing away first: "
+        "a sample does not need a participant, so their tubes are kept and come off the "
+        "record instead.")],
+) -> str:
+    """Remove a participant. Their samples survive without one; the enrolments go with them."""
+    row = _record(get_service().delete_patient(patient_id))
+    return {k: row.get(k, "") for k in
+            ("patient_id", "enrolments_removed", "samples_unlinked")}
+
+
+@mcp.tool()
+@_guard
+def delete_project(
+    project_id: Annotated[str, _param(
+        "Project's prj_ id, from search_projects. Refused, with the ids to act on, if a "
+        "subproject still hangs off this one or if a participant here cannot be moved "
+        "unambiguously -- they hold no other project, or they hold several and the "
+        "destination is your call.")],
+) -> str:
+    """Remove a project, taking each participant's samples to the one project they have left."""
+    row = _record(get_service().delete_project(project_id))
+    return {k: row.get(k, "") for k in
+            ("project_id", "enrolments_removed", "samples_repointed", "samples_cleared",
+             "moved_to")}
+
+
+@mcp.tool()
+@_guard
+def delete_assay(
+    assay_id: Annotated[str, _param(
+        "Assay's asy_ id, from list_assays -- not its code. Refused while any reading is "
+        "filed against it, since those numbers would lose the definition that makes them "
+        "comparable; the refusal lists the readings by id.")],
+) -> str:
+    """Remove a kind of measurement, once nothing has been measured with it.
+
+    Readings are immutable and nothing discards one from here, so an assay with history
+    stays and keeps explaining what its numbers were; this lands on the ones defined and
+    never used.
     """
-    return get_service().delete_item(item_id, force=force)
+    row = _record(get_service().delete_assay(assay_id))
+    return {"assay_id": row.get("deleted_assay", "")}
 
 
 @mcp.tool()
 @_guard
-def delete_container(container_id: str) -> str:
-    """Remove a container. Refuses while it holds items or child containers."""
-    return get_service().delete_container(container_id)
+def merge_items(
+    keep_id: Annotated[str, Field(
+        description="The row that survives; blanks in it are filled from discard_id, and "
+                    "discard_id's notes are appended to its own.")],
+    discard_id: Annotated[str, Field(
+        description="The duplicate being retired. Its measurements and derivation "
+                    "links re-point at keep_id.")],
+    reason: Annotated[str, Field(
+        description="Free text explaining why these are the same thing.")] = "",
+) -> str:
+    """Merge a duplicate into the kept item; the other is tombstoned."""
+    row = _record(get_service().merge_items(keep_id, discard_id, reason=reason))
+    return {k: row.get(k, "") for k in ("kept", "discarded", "references_repointed")}
 
 
 @mcp.tool()
 @_guard
-def merge_items(keep_id: str, discard_id: str, reason: str = "") -> str:
-    """Merge a duplicate into the kept item; the other is tombstoned.
-
-    Measurements and derivation links re-point at keep_id; blanks are filled from
-    discard_id.
-    """
-    return get_service().merge_items(keep_id, discard_id, reason=reason)
-
-
-@mcp.tool()
-@_guard
-def export_data(directory: str = "") -> str:
-    """Write CSV views + SQLite mirror + manifest.json for dashboards."""
-    return get_service().export(directory=directory)
+def unassign_patient_project(
+    patient_id: Annotated[str, Field(description="Participant's pat_ id; see search_patients.")],
+    project_id: Annotated[str, Field(
+        description="Project to withdraw them from; it must be one of their enrolments.")],
+    move_to: Annotated[str, Field(
+        description="Optional prj_ id to re-point this participant's samples at; it must be "
+                    "another project they are already enrolled in. Omit it to leave those "
+                    "samples with no project rather than block the withdrawal.")] = "",
+) -> str:
+    """Withdraw a participant from a project, settling their samples in the same write."""
+    return _record(get_service().unassign_patient_project(patient_id, project_id,
+                                                          move_to=move_to))

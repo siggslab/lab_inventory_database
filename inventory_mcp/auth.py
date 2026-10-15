@@ -40,6 +40,44 @@ _INSTALL_HINT = (
     "Drive support needs the 'drive' extra:  pip install -e '.[drive]'"
 )
 
+#: The lab's own OAuth client, shipped inside the package. An installed-app client
+#: secret is not something to keep confidential (RFC 8252 treats it as distributed
+#: with the binary): it authorises nothing on its own — a human still has to approve
+#: the consent screen — and without it nobody can start the flow that produces a
+#: token. What stays private is the token, which lives on the machine that earned it.
+PACKAGED_CLIENT_SECRET = Path(__file__).resolve().with_name("client_secret.json")
+
+
+def resolve_client_secret(config) -> Path:
+    """Where the installed-app client JSON actually comes from.
+
+    A copy at the configured path wins, so anyone who registered their own client
+    keeps using theirs; otherwise the packaged one answers, which leaves a fresh
+    install able to run ``auth`` with no setup step at all.
+    """
+    raw = str(getattr(config, "client_secret_path", "") or "").strip()
+    if raw:
+        configured = Path(raw).expanduser()
+        # is_file, not exists: an unset path arrives as "" and Path("") is the
+        # working directory, which exists and is not a client secret.
+        if configured.is_file():
+            return configured
+    return PACKAGED_CLIENT_SECRET
+
+
+def _missing_client_error(config=None) -> AuthError:
+    """Built when raised, so it names the paths as they are now -- including the
+    configured one, which is the likelier place to have a typo."""
+    configured = str(getattr(config, "client_secret_path", "") or "").strip()
+    looked = ([f"the configured path {configured}"] if configured else []) + \
+             [f"the packaged copy {PACKAGED_CLIENT_SECRET}"]
+    return AuthError(
+        f"no OAuth client secret found; looked in {' and '.join(looked)}.\n"
+        "Create a 'Desktop app' OAuth client in Google Cloud Console with the Drive and "
+        "Sheets APIs enabled, download the JSON, and save it at either path. "
+        "Then run:  inventory-mcp auth"
+    )
+
 
 def _require_oauth():
     try:
@@ -69,13 +107,9 @@ def credentials(config, *, interactive: bool = False, manual: bool = False,
     if sa and Path(sa).expanduser().exists():
         return _service_account_credentials(sa)
 
-    secret = Path(getattr(config, "client_secret_path", "") or "").expanduser()
-    if not secret.exists():
-        raise AuthError(
-            f"no OAuth client secret at {secret}.\n"
-            "Create a 'Desktop app' OAuth client in Google Cloud Console, download "
-            "the JSON, and save it there. Then run:  inventory-mcp auth"
-        )
+    secret = resolve_client_secret(config)
+    if not secret.is_file():
+        raise _missing_client_error(config)
 
     Request, Credentials, InstalledAppFlow = _require_oauth()
     token = Path(config.token_path).expanduser()
@@ -124,13 +158,9 @@ def authorize(config, *, manual: bool = False, port: int = 8080,
         drive_service(config)
         return Path(sa)
     Request, Credentials, InstalledAppFlow = _require_oauth()
-    secret = Path(config.client_secret_path).expanduser()
-    if not secret.exists():
-        raise AuthError(
-            f"no OAuth client secret at {secret}.\n"
-            "Create a 'Desktop app' OAuth client in Google Cloud Console and save "
-            "the downloaded JSON there."
-        )
+    secret = resolve_client_secret(config)
+    if not secret.is_file():
+        raise _missing_client_error(config)
     creds = _run_flow(InstalledAppFlow, secret, manual=manual, port=port)
     token = Path(config.token_path).expanduser()
     _save_token(token, creds.to_json())

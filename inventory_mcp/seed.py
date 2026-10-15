@@ -63,18 +63,18 @@ def seed(svc: Service) -> dict:
     geneadd = _id(svc.create_project("GeneAdd registry", status="active").records)
 
     # -- patients -------------------------------------------------------------
-    jacobs = _id(svc.create_patient("JaCo", sex="female", dob="2005-08-20",
+    # Each participant arrives inside the project holding their material: a
+    # participant's project list is exact, so this is where their tubes become
+    # filable. ShNo joins a second project afterwards.
+    jacobs = _id(svc.create_patient("JaCo", stat5b, sex="female", dob="2005-08-20",
                                     affected_status="affected", gene="STAT5B",
                                     variant="T628S", protocol="HREC 2022/041").records)
-    shno = _id(svc.create_patient("ShNo", sex="male", dob="1961-04-28",
+    shno = _id(svc.create_patient("ShNo", circa, sex="male", dob="1961-04-28",
                                   affected_status="affected", gene="UBA1",
                                   protocol="HREC 2022/041").records)
-    hc = _id(svc.create_patient("HC_99801143", sex="female", affected_status="unaffected",
+    hc = _id(svc.create_patient("HC_99801143", circa, sex="female", affected_status="unaffected",
                                 protocol="HREC 2020/118").records)
-    svc.assign_patient_project(jacobs, circa)
-    svc.assign_patient_project(shno, circa)
     svc.assign_patient_project(shno, vexas)
-    svc.assign_patient_project(hc, circa)
 
     # -- samples with derivation links ----------------------------------------
     blood = _id(svc.create_sample(
@@ -83,7 +83,7 @@ def seed(svc: Service) -> dict:
         source_material="Venous blood", collected_on="2023-11-13", received_on="2023-11-14",
         processed_on="2023-11-14", handler="Julia",
         notes="Tube provided to Igor for HMW DNA extraction").records)
-    _track(svc.record_measurement(blood, "volume_ul", value="100", unit="ul",
+    _track(svc.record_measurement(blood, "volume_ul", value_num="100", unit="ul",
                                   measured_on="2023-11-14T09:00"))
 
     pbmc = _id(svc.create_sample(
@@ -91,9 +91,9 @@ def seed(svc: Service) -> dict:
         gml_id="GML000487", patient_id=jacobs, project_id=stat5b,
         source_material="Venous blood", collected_on="2022-03-03", handler="AMR").records)
     svc.link_items(pbmc, blood, "derived_from", "PBMC isolation from the 2022 draw")
-    _track(svc.record_measurement(pbmc, "cell_count", value="5.3", unit="",
+    _track(svc.record_measurement(pbmc, "cell_count", value_num="5.3", unit="",
                                   measured_on="2022-03-03T10:00", notes="x10^6 per ml"))
-    _track(svc.record_measurement(pbmc, "cell_viability", value="94", unit="%",
+    _track(svc.record_measurement(pbmc, "cell_viability", value_num="94", unit="%",
                                   measured_on="2022-03-03T10:05"))
 
     dna = _id(svc.create_sample(
@@ -101,17 +101,17 @@ def seed(svc: Service) -> dict:
         gml_id="GML000495", patient_id=jacobs, project_id=stat5b,
         source_material="PBMC", handler="Julia").records)
     svc.link_items(dna, pbmc, "extracted_from")
-    _track(svc.record_measurement(dna, "qubit_dsdna", value="49.0", unit="ng/ul",
+    _track(svc.record_measurement(dna, "qubit_dsdna", value_num="49.0", unit="ng/ul",
                                   measured_on="2024-05-16T11:00", instrument="Qubit 4"))
-    _track(svc.record_measurement(dna, "volume_ul", value="40", unit="ul",
+    _track(svc.record_measurement(dna, "volume_ul", value_num="40", unit="ul",
                                   measured_on="2024-05-16T11:05"))
     # Nanodrop read, then a correction appended rather than edited in place --
     # measurements are immutable, so the original stays visible.
-    first_read = svc.record_measurement(dna, "nanodrop_a260", value="132.0", unit="ng/ul",
+    first_read = svc.record_measurement(dna, "nanodrop_a260", value_num="132.0", unit="ng/ul",
                                         measured_on="2024-05-16T11:20")
     svc.correct_measurement(
         first_read.records[-1]["measurement_id"],
-        value="88.5", unit="ng/ul", measured_on="2024-05-17T09:00",
+        value_num="88.5", unit="ng/ul", measured_on="2024-05-17T09:00",
         notes="re-read after dilution error",
     )
 
@@ -120,9 +120,9 @@ def seed(svc: Service) -> dict:
         gml_id="GML001994", patient_id=jacobs, project_id=stat5b,
         source_material="genomic DNA", handler="Julia").records)
     svc.link_items(aliquot, dna, "aliquot_of")
-    _track(svc.record_measurement(aliquot, "qubit_dsdna", value="47.2", unit="ng/ul",
+    _track(svc.record_measurement(aliquot, "qubit_dsdna", value_num="47.2", unit="ng/ul",
                                   measured_on="2024-06-01T09:00"))
-    _track(svc.record_measurement(aliquot, "volume_ul", value="20", unit="ul",
+    _track(svc.record_measurement(aliquot, "volume_ul", value_num="20", unit="ul",
                                   measured_on="2024-06-01T09:05"))
 
     # statuses across the board
@@ -130,16 +130,16 @@ def seed(svc: Service) -> dict:
         "GeneAdd S00366F DNA (exhausted)", "dna", gml_id="GML001996",
         project_id=geneadd, source_material="Venous blood",
         notes="Fully consumed during library prep", status="consumed").records)
-    _track(svc.record_measurement(consumed, "qubit_dsdna", value="96.0", unit="ng/ul",
+    _track(svc.record_measurement(consumed, "qubit_dsdna", value_num="96.0", unit="ng/ul",
                                   measured_on="2024-04-22T14:00"))
 
     partial = _id(svc.create_sample(
         "ShNo plasma", "plasma", location_id=box_vexas, position="E2",
         gml_id="GML001644", patient_id=shno, project_id=vexas,
         source_material="Venous blood", status="partially_consumed").records)
-    _track(svc.record_measurement(partial, "volume_ul", value="1500", unit="ul",
+    _track(svc.record_measurement(partial, "volume_ul", value_num="1500", unit="ul",
                                   measured_on="2023-12-01T10:00"))
-    _track(svc.record_measurement(partial, "volume_ul", value="1200", unit="ul",
+    _track(svc.record_measurement(partial, "volume_ul", value_num="1200", unit="ul",
                                   measured_on="2024-02-10T10:00",
                                   notes="300 ul taken for methylation assay"))
 
@@ -166,7 +166,7 @@ def seed(svc: Service) -> dict:
         storage_requirements="-20C, avoid repeated freeze/thaw",
         initial_quantity="500", quantity_assay="reagent_volume", quantity_unit="ul",
         quantity_measured_on="2026-08-04T10:00").records)
-    _track(svc.record_measurement(enzyme, "reagent_volume", value="420", unit="ul",
+    _track(svc.record_measurement(enzyme, "reagent_volume", value_num="420", unit="ul",
                                   measured_on="2026-09-12T15:00",
                                   notes="80 ul used for the STAT5B amplicon panel"))
 
@@ -176,7 +176,7 @@ def seed(svc: Service) -> dict:
         storage_requirements="Store all components at -20C; equilibration at room temp before use",
         initial_quantity="48", quantity_assay="kit_uses_remaining", quantity_unit="count",
         quantity_measured_on="2026-09-02T09:00").records)
-    _track(svc.record_measurement(kit, "kit_uses_remaining", value="41", unit="count",
+    _track(svc.record_measurement(kit, "kit_uses_remaining", value_num="41", unit="count",
                                   measured_on="2026-10-01T09:30"))
 
     tips = _id(svc.create_supply(
@@ -188,7 +188,7 @@ def seed(svc: Service) -> dict:
     qc = _id(svc.create_sample("JaCo DNA post-library QC", "library", location_id=box_vexas,
                                position="F1", gml_id="GML002001", patient_id=jacobs,
                                project_id=stat5b, source_material="genomic DNA").records)
-    svc.record_measurement(qc, "gel_qc", text="single high-molecular-weight band, no smearing",
+    svc.record_measurement(qc, "gel_qc", value_text="single high-molecular-weight band, no smearing",
                            measured_on="2024-06-05T13:00", handler="Julia")
 
     # Counted from what landed rather than tallied as we go; a hand-maintained

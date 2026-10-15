@@ -1,45 +1,119 @@
 # inventory-mcp
 
-An on-device MCP server over a lab's biological-sample inventory, stored as
-plain CSV so the files stay readable, diffable and auditable without a database
-engine.
+This is a lightweight Lab Inventory Management System designed with Model use in mind.
 
-The server is the layer that makes CSVs safe to treat as a database: identifiers
-are minted rather than typed, foreign keys are checked on every write, box
-geometry is validated against what actually fits, measurements carry units that
-get checked against the assay they belong to, and every write either applies
-completely or does not happen at all.
+The database is backed by either locally stored csv files, or google sheet files stored
+on a shared google drive (which additionally is how access control is handled).
 
-## Status
+This database contains an MCP layer, allowing models to interact with the database in
+constrained ways, and a Services layer which provide python bindings to the same tools,
+allowing easy creation of a dashboard for a user by those same models.
 
-| | |
-| --- | --- |
-| Data model, validation, service layer | done |
-| Local CSV backend (flock + compare-and-swap) | done |
-| MCP tools (31), CLI, exports, guarded SQL | done |
-| Google Drive backends (`drive_csv`, `drive_sheets`) | done — verified live: seed, doctor, reads, export, and adversarial cases (browser edits, concurrent writers, deleted files, renamed tabs) |
-| Test suite | 110 passing |
-| Legacy Airtable importer | deferred by design |
-
-Nothing here is shaped around the old spreadsheet. The import is a separate task
-with its own problem — thousands of rows with dangling references — and folding
-that in would have bent the schema for the wrong reason.
+Additionally, as the database is backed by human readable files, it is designed so that
+reading and editing it manually is possible, if not recommended. If mal-formatted edits
+are made manually, they will need to be rectified before further machine-made edits can be made
 
 ## Install
 
+Download this repository to a local directory, create a python venv of version at least 3.10+
+and install this project into the venv
+
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e '.[dev]'          # add ,[drive] for the Google Drive backends
+pip install -e '.[drive,dev]'          # add ,[drive] for the Google Drive backends
 ```
 
-Python 3.10+. The only hard dependency is the MCP SDK; the Drive backends pull
-`google-api-python-client` through the `drive` extra.
+## Setup against the lab's Drive folder
 
-## Quickstart
+**1. Google authentication**
+
+You will need to authenticate with your google account with visibility over the shared drive
+before your machine can use a remotely stored database
+
+**1. Initialisation.**
+
+Create a congfig file with the init command, specifying the use of the google-drive based backend
+and a folder. If you wish to use one that already exists: configuration is read from
+`--config <path>` (the flag goes before the subcommand), then`~/.config/inventory-mcp/config.json`,
+then `$INVENTORY_MCP_CONFIG`.
 
 ```bash
-# create the table files, optionally with development data
-inventory-mcp --config ./db.config.json init --root ./db --seed --actor you
+inventory-mcp init --backend drive \
+  --drive-folder <URL of database folder>
+inventory-mcp show-config
+```
+
+`init` additionally will open the folder its pointed to and create the tables needed for the database.
+In an existing database it adds only the tables that are missing.
+
+The `--seed` param can be passed to generate dummy testing data for the tables at initialisation. 
+The `--reset` param can be passed to discards every entry in the database. and re-initialise it from scratch.
+
+**Destructive Flags**
+Note, as these two flags (seed, and particularly reset) are not used outside a development context, and 
+have the potential to wipe the database, and because users will likely be pointing this at an in-use shared 
+google drive with write permissions, these two flags are disabled by default and will just produce an error.
+They must first be intentionally enabled in the cli.py file first.
+
+**2. Google authentication**
+
+Create a token that authenticates this program with your account, allowing it to read/write to the
+shared drive
+
+```bash
+source .venv/bin/activate
+inventory-mcp auth            # opens a browser on this machine
+inventory-mcp auth --manual   # headless: prints the URL, you paste the redirect back
+inventory-mcp auth --check    # verify the stored token without prompting
+```
+
+The token is cached at `~/.config/inventory-mcp/oauth_token.json`, mode `0600`. 
+
+The consent screen belongs to one OAuth *Desktop* client shared by everyone, and its JSON
+ships at `inventory_mcp/client_secret.json`. That file holds a client id and secret, which is
+supposedly (RFC 8252) how google intends apps to identify themselves. Permissions and authentication
+are then granted by the user login, which creates a login token then present only on the user's machine.
+
+A custom client for a new/different lab can instead be placed at `~/.config/inventory-mcp/client_secret.json`
+which overrides the one this repository ships with. Changing this in a live environment requires all users to
+reauthenticate
+
+**3. Add this repo as an MCP serer for your model.** In many harnesses, the config for this looks as follows, but consult
+your harness' specific documentation:
+
+```json
+{
+  "mcpServers": {
+    "lab-inventory": {
+      "command": "/path/to/.venv/bin/inventory-mcp",
+      "args": ["serve"]
+    }
+  }
+}
+```
+
+other optional arguments and env variables may be included, such as '--config' to point to a config
+file at a specific path
+
+**4. Post Setup**
+
+On initialising a fresh database, some things should be done first:
+
+- **A fresh database has no assays.** So measurements such as the volume of a sample cannot be recorded. 
+Every measurement names an assay and is checked against, so (`create_assay`) should be used to setup some basic measurements
+- **A Drive read can time out partway through `init`.** If so, simply re-run init, and existing tables
+will be skipped
+- **Shared drives work, but only for a client that asks.** A file in a team drive is reported
+  as *missing* unless the request passes `supportsAllDrives`. So a 404 on a folder you can see
+  in the browser is a client bug, not a lost file — worth remembering before concluding that
+  somebody deleted the database.
+
+## Quickstart (local files, not drive)
+
+```bash
+# create the table files. Note, unlike in other commands that read the config file, this one *writes*
+# the config file to this location
+inventory-mcp --config ./db.config.json init --root ./db --actor you
 
 # look at it
 inventory-mcp --config ./db.config.json ls                  # items
@@ -71,62 +145,60 @@ Then point an MCP client at it:
 `inventory-mcp tools` prints the tool catalogue as the server actually registers
 it. See [docs/tools.md](docs/tools.md) for the conventions behind it.
 
-## What gets stored
+## Database structure
 
-Twelve tables under `tables/`, one CSV each, header row included:
+There are twelve tables:
 
 ```
-containers        the storage tree: freezer > shelf > rack > box, plus fridge/bench
-items             supertype: every storable thing, one row each
-samples           extends items     reagents    extends items
-kits              extends items     consumables extends items
-patients          participants, kept separate from samples
-projects          optionally nested via parent_project_id
-patient_projects  who is enrolled in what
-item_links        derivation edges: derived_from, extracted_from, aliquot_of, pooled_into
-assays            registry of measurement kinds, with quantity and canonical unit
-measurements      immutable observations referencing an assay
+containers        Objects which store other objects, and their hierachy e.g. freezer > shelf > rack > box, plus fridge/bench
+items             Objects that you store. Subclassed into e.g. samples, kits etc.
+samples           Extends items, records data such as patient of origin
+reagents          Extends items, records data such as volumes
+kits              Extends items, records data such as uses remaining
+consumables       Extends items
+patients          Participants, linked to samples and projects. Optionally may contain demographic info
+projects          For grouping other objects. Can be nested, with a project as a subproject of another
+patient_projects  Table linking which participants are in which projects. (it's not 1-to-1, a patient can be in multiple projects)
+item_links        Table linking items relations to each other. Such as a DNA tube extracted from a blood sample tube
+assays            Table listing kinds of measurement that may be applied to items (e.g. volume). Needed for database reasons
+measurements      List of measurements as applied to items, with history. 
 ```
 
-Design decisions worth knowing before changing anything:
+Structural dev notes:
 
-- **Supertype + extension tables.** An item is an `items` row plus exactly one
-  class row. Adding a new kind of thing means adding a table, not inventing a
-  side channel. Reagents, kits and consumables share the same four supply fields
-  but stay three tables because a kit's remaining-uses and a reagent's remaining
-  volume are different questions.
-- **Opaque ids.** `<prefix>_<8 chars>` from an alphabet missing `i l o u`. Ids
-  carry no meaning on purpose — encoding the project or the freezer means having
-  to change the id when someone moves the tube. Human naming lives in `name`,
-  `label` and `gml_id`, all freely mutable.
-- **Storage is one foreign key.** `items.location_id` → `containers`, plus an
-  optional `position`. There is no path string to keep in sync. Boxes declare
-  `rows`/`cols` (and optionally custom `row_labels`/`col_labels` for the box whose
-  grid skips `I`), so `Z20` in a 9×9 box is refused rather than written.
-- **Measurements never change.** A correction appends a new row and marks the old
-  one superseded. Derived quantities like total yield are computed on read, so
-  there is nothing to invalidate.
-- **Derivation is a junction table.** Aliquots today, pools later — many parents into
-  one child needs no migration because the shape was already there.
+- **Items.** An item is an `items` row plus exactly one
+  class row. Adding a new kind of item means adding a table.
+- **Ids.** Everything has an id of the form `<prefix>_<8 chars>`
+  from an alphabet missing `i l o u`.  Human readable naming lives in the `name`,
+  `label` and `gml_id` fields, all of which are freetext.
+- **Storage** Item storage is a foreign key into the containers table. 
+  Position within a container, such as tube row/column, is optional but encouraged, and there
+  for user convenience. It is not mandatory based on current practice that location isn't
+  often recorded at greater granularity than the box level
+- **Projects don't inherit samples.** For samples registered under a patient and a project,
+  the chosen project must exactly match one the patient is also registered under.
+- **Measurements are immutable.** They are intended as a recorded chain of past measurements
+  on a given item. If one is invalid on a given assay, just make a new one to overwrite its
+  place as the most recent one. Usually only the most recent is read. Though if you really need to
+  nothing is stopping you deleting/editing the most recent one directly in the spreadsheet.
 
-## Integrity contract
+## Database Integrity Violations
 
-The files are authoritative and are never blindly trusted, because someone will
-open them in a spreadsheet.
+Because this structure allows for files to be manually opened and edited in the shared
+drive, certain things happen if manual edits break the from the proper database structure:
 
 - **Reads degrade.** A corrupt row doesn't crash the reader. Valid rows come back
   with the problems listed as violations.
 - **Writes refuse.** Validation runs against a candidate state first. If anything
-  in scope is broken, the write is rejected with every violation listed, and
-  nothing is touched — no partial file, no backup generation.
-- **`doctor` reports everything**, whether or not it blocks a particular write.
+  in scope is broken, the write is rejected with every violation listed
+- **The `doctor` tool reports violations**, so they can be fixed
 
-Before any accepted write, the pre-write content of the tables being changed is
-copied to `backups/<timestamp>-<operation>/`. That is the undo story: no event
-journal, but any write can be reverted by copying files back. `keep_backups`
-caps how many generations survive. A Drive backend has no local directory to
-copy into, so the write result reports `snapshot: none` and the undo story is
-Drive's own version history for those files.
+Locally, before any accepted write, the pre-write content of the tables being changed is
+copied to `backups/<timestamp>-<operation>/`. This way, writes can be reverted by
+copying files back. The `keep_backups` config caps how many generations survive.
+
+A Drive backend has no local directory to copy into, so the write result reports
+`snapshot: none` and the undo should be performed with Drive's own version history.
 
 Writes also carry a revision token per table. If the file changed underneath —
 the classic case being a spreadsheet save while the server holds the database
@@ -140,82 +212,20 @@ guarantee that matters.
 JSON at `~/.config/inventory-mcp/config.json`, or `$INVENTORY_MCP_CONFIG`, or
 `--config <path>` (the flag must come before the subcommand).
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `backend` | `local` | `local`, `drive_csv`, `drive_sheets` |
-| `local_root` | — | directory holding `tables/ exports/ backups/` |
-| `drive_folder_id` | — | Drive folder id, or a pasted folder URL — both parse |
-| `drive_file_ids` | `{}` | logical table name → file id, when names collide |
-| `token_path` | `~/.config/inventory-mcp/oauth_token.json` | OAuth token cache |
-| `client_secret_path` | `~/.config/inventory-mcp/client_secret.json` | installed-app credentials |
-| `service_account_path` | `~/.config/inventory-mcp/service_account.json` | if this key exists it wins over the OAuth flow |
-| `cache_ttl_seconds` | `5.0` | how long a remote read may be served from cache |
-| `keep_backups` | `20` | pre-write generations retained |
-| `actor` | derive | identity written into `updated_by` |
+| Key | Default | Meaning                                                                         |
+| --- | --- |---------------------------------------------------------------------------------|
+| `backend` | `local` | `local`, `drive`                                                                |
+| `local_root` | — | directory holding `tables/ exports/ backups/`                                   |
+| `drive_folder_id` | — | Drive folder id, or a pasted folder URL — both parse                            |
+| `drive_file_ids` | `{}` | logical table name → file id, when names collide                                |
+| `token_path` | `~/.config/inventory-mcp/oauth_token.json` | OAuth token cache                                                               |
+| `client_secret_path` | `~/.config/inventory-mcp/client_secret.json` | an OAuth client of your own; absent that, the one packaged with the app is used |
+| `service_account_path` | `~/.config/inventory-mcp/service_account.json` | if this key exists it wins over the OAuth flow                                  |
+| `cache_ttl_seconds` | `5.0` | how long a remote read may be served from cache                                 |
+| `keep_backups` | `20` | pre-write generations retained                                                  |
+| `actor` | derive | Your name, for wherever entries have an `updated_by` field                      |
 
-A bad key in the file is reported and ignored rather than silently dropped.
-
-## Running against Google Drive
-
-The tables live in one access-controlled folder; nothing needs to be mounted.
-Pass the folder as a URL and it is reduced to an id at load time:
-
-```bash
-inventory-mcp --config ./db.config.json init --backend drive_sheets \
-  --drive-folder "https://drive.google.com/drive/folders/1AbC..." --seed
-```
-
-`drive_sheets` keeps one spreadsheet per table with the tab named after the
-table, which is what people actually open and read. `drive_csv` keeps real CSV
-files in the same folder — fewer conversions, but Drive will convert them to
-spreadsheets on upload unless the MIME type is declared, so the server declares
-it and refuses to read back a file that got converted anyway.
-
-Credentials are for a **Desktop** OAuth client (an institute Google account is
-enough; no GCP project per user beyond the one consent screen). Drop the
-downloaded JSON at `~/.config/inventory-mcp/client_secret.json`, then:
-
-```bash
-inventory-mcp auth            # opens a browser; the token is cached at 0600
-inventory-mcp auth --manual   # prints the URL, you paste the redirect back
-inventory-mcp auth --check    # verify the stored token without prompting
-```
-
-Authorisation is a separate command because `serve` owns stdin — an MCP server
-that blocked on a browser consent would look like a hang. A service-account key
-at `service_account_path` takes precedence, which suits a shared machine where
-you would rather an RA not have to consent at all.
-
-What changes once the files are remote, honestly stated:
-
-- **Concurrency is detect-and-abort.** There is no per-range precondition in the
-  Sheets API or Drive's upload endpoint, so the check compares the revision read
-  at load time with the revision fetched just before writing. It catches an edit
-  that landed before the commit began; two sessions that both loaded the same
-  revision will both pass and the later write wins. Drive's version history is
-  the backstop for that case, not this code.
-- **Sheets coerces.** A spreadsheet cell has types and a CSV field does not, so
-  values come back re-parsed: numbers normalise (`1.50` → `1.5`), ISO timestamps
-  can arrive as locale date strings, `TRUE` arrives as `true`. The store converts
-  what it recognises on the way in, and every write is verified by reading back
-  what Drive actually stored and re-rendering it — a mismatch raises rather than
-  persisting a silent mutation. The live pass proved this contract earns its
-  keep: real divergences were caught and aborted instead of landing quietly.
-- **Reads may be up to `cache_ttl_seconds` stale.** Set it to `0` for a
-  read-your-writes guarantee at the cost of one API call per table per operation.
-- **The Sheets read quota is 60 requests/minute/user** and every operation costs
-  read + write + verify. Transient 429s are waited out (≥30 s, so a quota window
-  resets), which makes bulk work like `init --seed` slow-but-fatal-free — a real
-  thousand-row import will want batched writes before it happens.
-- **Shrinking a table** writes the new rows first and clears the leftover rows
-  under them afterwards (`values().clear`; Drive-created spreadsheets report no
-  grid size, so sized row-deletes are not available), so there is no moment
-  where the sheet is empty.
-- Hand-editing a table the server is about to write aborts that write. Editing a
-  *different* table while a write is in flight goes unnoticed — CAS covers only
-  the tables the commit touches.
-
-## Command line
+## Command line Reference
 
 | Command | Purpose |
 | --- | --- |
@@ -225,6 +235,7 @@ What changes once the files are remote, honestly stated:
 | `doctor` | integrity report; exit 1 when errors exist (`--json`, `--quiet`) |
 | `ls` | list items, or `--containers` |
 | `occupancy` | fill levels per container (`[container_id]`, `--kind`) |
+| `enrol` | give each sample's pairing its own enrolment row (`--from-ancestors`, `--dry-run`) |
 | `query` | guarded read-only SQL |
 | `export` | flat CSV views + SQLite mirror + manifest |
 | `schema` | the field-by-field reference (`--json`) |
@@ -233,30 +244,6 @@ What changes once the files are remote, honestly stated:
 
 ## Building a dashboard on this
 
-Not through MCP — that's a control plane for a model, not a data plane for many
-readers. Read the exports or import `inventory_mcp.service`. See
-[docs/dashboard.md](docs/dashboard.md) for the view-by-view reference, the
-freshness rules, and the stability guarantees a consumer may rely on.
-
-## Tests
-
-```bash
-pytest
-```
-
-Unit tests for unit arithmetic and id minting; validation tests that corrupt the
-CSVs behind the service's back, because that is how corruption really arrives;
-integration tests driving full mutation paths against real files; assertions that
-a rejected write leaves no trace and that an external edit aborts the next write;
-an export round-trip checking manifest freshness and SQLite/CSV row-count
-agreement; and a real MCP handshake over stdio against a spawned server process.
-
-The Drive tests run with no network and no credentials, against fakes shaped like
-the discovery client (`files()` / `spreadsheets()` / `values()`, each returning a
-request object that fails when executed, so retry logic sees failures where the
-real client sees them). They cover upload conversion, cell coercion, revision
-conflicts, shrink-trim, missing tabs and transient HTTP status handling — and
-then drive `init`, `seed`, `doctor` and a commit through the whole stack on both
-backends. Four production bugs came out of writing them. What they cannot test
-is what Google actually does to a value on the way in, which is why the live pass
-is listed as pending rather than done.
+This database also provides python bindings to all tools to allow easily building a dashboard
+application. Read the exports or import `inventory_mcp.service`. See
+[docs/dashboard.md](docs/dashboard.md) for the view-by-view reference.

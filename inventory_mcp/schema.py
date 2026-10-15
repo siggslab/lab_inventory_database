@@ -77,6 +77,9 @@ CONTAINER_KINDS = (
 
 ITEM_CLASSES = ("sample", "reagent", "kit", "consumable")
 
+#: Supplies rather than biological material -- the classes ``create_supply`` can make.
+SUPPLY_CLASSES = tuple(c for c in ITEM_CLASSES if c != "sample")
+
 #: Extension table backing each item class.
 CLASS_EXTENSION_TABLE = {
     "sample": "samples",
@@ -116,6 +119,8 @@ SAMPLE_TYPES = (
 
 PROJECT_STATUSES = ("active", "delivered", "concluded", "on_hold")
 
+SEXES = ("female", "male", "other", "unknown")
+
 AFFECTED_STATUSES = ("affected", "unaffected", "unknown", "cell_line")
 
 RESULT_TYPES = ("numeric", "text")
@@ -144,7 +149,7 @@ LINK_ROLES = ("aliquot_of", "extracted_from", "pooled_into", "derived_from", "ot
 
 _AUDIT_FIELDS = (
     Field("updated_by", "str", doc="Account written by the server, not user-supplied."),
-    Field("updated_at", "datetime", doc="Written by the server, not user-supplied."),
+    Field("updated_at", "datetime", doc="Written by the server, not user-supplied. UTC with a trailing Z."),
 )
 
 # Supply classes (reagent/kit/consumable) share this shape today. They stay as
@@ -238,7 +243,7 @@ ITEMS = Table(
         Field(
             "deleted_at",
             "datetime",
-            doc="Tombstone. Consumed and discarded items are kept for the record.",
+            doc="Tombstone. Consumed and discarded items are kept for the record. UTC with a trailing Z.",
         ),
         *_AUDIT_FIELDS,
     ),
@@ -312,7 +317,7 @@ PATIENTS = Table(
     fields=(
         Field("patient_id", "id", required=True),
         Field("label", "str", required=True, doc="Human-facing participant code."),
-        Field("sex", "str", enum=("female", "male", "other", "unknown")),
+        Field("sex", "str", enum=SEXES),
         Field("dob", "date"),
         Field("affected_status", "str", enum=AFFECTED_STATUSES),
         Field("gene", "str"),
@@ -345,7 +350,8 @@ PATIENT_PROJECTS = Table(
     filename="patient_projects.csv",
     primary_key="link_id",
     id_prefix="ppl",
-    doc="Which projects a participant belongs to. A sample's project must be one of these.",
+    doc="Which projects a participant belongs to. A sample's project must be one of "
+        "these exactly -- a subproject of one is not.",
     fields=(
         Field("link_id", "id", required=True),
         Field("patient_id", "id", required=True, fk="patients.patient_id"),
@@ -381,7 +387,7 @@ ASSAYS = Table(
         "Controlled vocabulary of measurement types. Units alone do not make "
         "values comparable -- Qubit and Nanodrop both report ng/ul and disagree "
         "routinely -- so each assay declares the quantity it measures, its "
-        "canonical unit, and whether its result is numeric or textual."
+        "canonical unit, and whether its result is numeric or qualitative."
     ),
     fields=(
         Field("assay_id", "id", required=True),
@@ -409,7 +415,9 @@ MEASUREMENTS = Table(
         Field("measurement_id", "id", required=True),
         Field("item_id", "id", required=True, fk="items.item_id"),
         Field("assay_id", "id", required=True, fk="assays.assay_id"),
-        Field("measured_on", "datetime", required=True),
+        Field("measured_on", "datetime", required=True,
+              doc="UTC to the minute, stored with a trailing Z. A zone spelled out on the way in "
+                  "(...Z, ...+10:00) is folded into UTC first, so the column keeps one spelling."),
         Field("value_num", "float"),
         Field("value_text", "text"),
         Field("unit", "str", doc="Unit of the recorded value; converted to canonical on read."),

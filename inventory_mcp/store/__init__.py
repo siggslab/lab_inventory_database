@@ -27,8 +27,8 @@ def make_store(config):  # -> TableStore
         from .local_csv import LocalCsvStore
 
         return LocalCsvStore(config.local_root)
-    if config.backend in ("drive_csv", "drive_sheets"):
-        from .drive import DriveCsvStore, DriveSheetsStore
+    if config.backend == "drive":
+        from .drive import DriveSheetsStore
 
-        return DriveCsvStore(config) if config.backend == "drive_csv" else DriveSheetsStore(config)
+        return DriveSheetsStore(config)
     raise StoreError(f"unknown backend {config.backend!r}")

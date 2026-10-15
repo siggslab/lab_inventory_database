@@ -10,7 +10,7 @@ from __future__ import annotations
 import calendar
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Optional
 
 from . import ids, schema, units
@@ -45,6 +45,17 @@ class Violation:
         }
 
 
+def key(v: Violation) -> tuple[str, str, str, str]:
+    """Identity of a violation, ignoring its message text.
+
+    Two states of the same standing problem must compare equal even when their messages
+    differ -- an over-capacity rack says "3 containers" and then "4" -- so the message is
+    deliberately left out. This is what lets a refused write tell damage it caused from
+    damage it merely walked into.
+    """
+    return (v.table, v.row_id, v.field, v.code)
+
+
 def errors(violations: Iterable[Violation]) -> list[Violation]:
     return [v for v in violations if v.severity == "error"]
 
@@ -62,6 +73,15 @@ _DATE_PATTERNS = (
 _DATETIME_PATTERNS = (
     ("%Y-%m-%dT%H:%M", re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$")),
     ("%Y-%m-%d %H:%M", re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")),
+)
+
+#: ISO 8601 spells a zone out either as ``Z`` or as an offset from UTC. Both are
+#: accepted on the way in so nobody has to guess what the server meant by a minute.
+_ZONE_SUFFIX = re.compile(r"([zZ]|[+-]\d{2}:?\d{2})$")
+
+_TIMESTAMP_HINT = (
+    "expected YYYY-MM-DDTHH:MM -- the time to the minute, optionally with its zone "
+    "spelled out as ...Z or ...+10:00"
 )
 
 _AMBIGUOUS_SLASH = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$")
@@ -90,16 +110,34 @@ def parse_date(value: str) -> tuple[Optional[date], Optional[str]]:
 
 
 def parse_datetime(value: str) -> tuple[Optional[datetime], Optional[str]]:
+    """Return (timestamp, problem). A spelled-out zone is folded into UTC.
+
+    The column stores UTC to the minute with ``Z`` on the end (see ``format_datetime``).
+    Anything arriving without a marker is read as UTC rather than refused, so a hand edit
+    that drops the suffix costs a `doctor` warning instead of losing the row; an offset
+    arrives as its own instant in UTC.
+    """
     v = value.strip()
     if not v:
         return None, None
+    zone = ""
+    if m := _ZONE_SUFFIX.search(v):
+        zone = m.group(1)
+        v = v[:m.start()].rstrip()
     for fmt, pattern in _DATETIME_PATTERNS:
         if pattern.match(v):
             try:
-                return datetime.strptime(v, fmt), None
+                dt = datetime.strptime(v, fmt)
             except ValueError as e:
                 return None, f"{value!r} is not a real timestamp ({e})"
-    return None, f"{value!r} is not a recognisable timestamp; expected YYYY-MM-DDTHH:MM"
+            if not zone or zone in {"z", "Z"}:
+                return dt, None
+            digits = zone[1:].replace(":", "")
+            offset = timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
+            if zone[0] == "-":
+                offset = -offset
+            return (dt - offset).replace(tzinfo=None), None
+    return None, f"{value!r} is not a recognisable timestamp; {_TIMESTAMP_HINT}"
 
 
 def parse_float(value: str) -> tuple[Optional[float], Optional[str]]:
@@ -127,7 +165,28 @@ def format_date(d: date) -> str:
 
 
 def format_datetime(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M")
+    """The one spelling this database stores timestamps in: UTC to the minute, ``Z`` on
+    the end -- ISO 8601's way of saying which zone without leaving it to be inferred.
+
+    A naive value is taken as already UTC, which is what ``now_utc_minute`` hands back
+    and what ``parse_datetime`` resolves everything else to; an aware one is converted
+    rather than stamped with a zone it did not claim.
+    """
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%dT%H:%M") + "Z"
+
+
+def strip_zone(value: str) -> str:
+    """A timestamp with its zone marker removed, for comparing against another.
+
+    Rows written before the marker landed name no zone while new ones spell ``Z``, and a
+    text comparison between the two spellings goes wrong at exactly the minute a bound
+    names -- the marked side sorts above the unmarked one. Asking both sides in the same
+    spelling first makes a comparison mean the instant rather than the way it was typed.
+    Dates carry no time of day and are left alone.
+    """
+    return _ZONE_SUFFIX.sub("", value.strip())
 
 
 def now_utc_minute() -> datetime:
@@ -152,6 +211,22 @@ def default_row_labels(n: int) -> list[str]:
                 break
         out.append(s)
     return out
+
+
+def default_col_labels(n: int) -> list[str]:
+    return [str(i + 1) for i in range(n)]
+
+
+def describe_axis(labels: list[str], defaults: list[str]) -> str:
+    """What a grid axis contains: ``A..M`` for the plain run, spelled out when it is not.
+
+    The range form lied precisely where it mattered. A box whose rows skip ``I`` answered
+    "rows are A..J" about a grid that has no ``I``, and the row the caller just reached
+    for is the one the gap sits on -- so the refusal sent them back to the same well.
+    """
+    if len(labels) > 1 and labels == defaults:
+        return f"{labels[0]}..{labels[-1]}"
+    return ", ".join(labels)
 
 
 def split_position(position: str) -> tuple[str, str] | None:
@@ -180,17 +255,17 @@ def validate_position(position: str, container: dict) -> Optional[str]:
         return None  # non-grid container; nothing to check against
 
     row_labels = _labels(container.get("row_labels"), rows_n, default_row_labels)
-    col_labels = _labels(container.get("col_labels"), cols_n, lambda n: [str(i + 1) for i in range(n)])
+    col_labels = _labels(container.get("col_labels"), cols_n, default_col_labels)
 
     if row_part.upper() not in {l.upper() for l in row_labels}:
         return (
             f"position {position!r} uses row {row_part!r}, which does not exist in this "
-            f"container (rows are {row_labels[0]}..{row_labels[-1]})"
+            f"container (rows are {describe_axis(row_labels, default_row_labels(rows_n))})"
         )
     if col_part.upper() not in {l.upper() for l in col_labels}:
         return (
             f"position {position!r} uses column {col_part!r}, which does not exist in this "
-            f"container (columns are {col_labels[0]}..{col_labels[-1]})"
+            f"container (columns are {describe_axis(col_labels, default_col_labels(cols_n))})"
         )
     return None
 
@@ -321,6 +396,15 @@ def _validate_fields(t: Table) -> list[Violation]:
                 _, problem = parse_datetime(value)
                 if problem:
                     out.append(Violation(t.name, rid, f.name, "bad_datetime", "error", problem))
+                elif not _ZONE_SUFFIX.search(value):
+                    # Not illegal -- an unmarked timestamp is read as UTC, and refusing a
+                    # row over a suffix would hold up reads over nothing harmful. But the
+                    # column's whole claim to be comparable is that it says which zone, so
+                    # the gap gets named where someone will see it rather than inferred.
+                    out.append(Violation(
+                        t.name, rid, f.name, "datetime_without_zone", "warning",
+                        f"{value!r} names no zone; read as UTC -- write it as ...Z or "
+                        "with its offset"))
     return out
 
 
@@ -516,43 +600,45 @@ def _validate_status_location(db: Database) -> list[Violation]:
 
 
 def _validate_sample_project_rule(db: Database) -> list[Violation]:
-    """If a sample names both a patient and a project, the patient must belong
-    to that project (or to an ancestor of it)."""
+    """If a sample names both a patient and a project, there must be an enrolment
+    row for exactly that pair.
+
+    Matching is exact on purpose. The project tree is how work is organised, not a
+    record of what anyone consented to, so inheriting enrolment downward would let
+    someone widen a participant's scope by creating a folder underneath them.
+    Enrolment is only ever widened by an explicit row.
+
+    Tombstoned items are skipped, as everywhere else that measures current state: a
+    deletion is history, and a retired tube must not keep claiming a routing that no
+    longer holds -- nor block a withdrawal forever.
+    """
     out: list[Violation] = []
     samples = db.t("samples")
     if samples.missing:
         return out
+    buried = {iid for iid, row in db.items_by_id().items()
+              if (row.get("deleted_at", "") or "").strip()}
     memberships: dict[str, set[str]] = {}
     for row in db.t("patient_projects").rows:
         pid = (row.get("patient_id", "") or "").strip()
         prid = (row.get("project_id", "") or "").strip()
         if pid and prid:
             memberships.setdefault(pid, set()).add(prid)
-    projects = {r["project_id"].strip(): r for r in db.t("projects").rows if r.get("project_id", "").strip()}
-
-    def ancestors(project_id: str) -> set[str]:
-        chain, seen = set(), set()
-        cur: Optional[str] = project_id
-        while cur and cur in projects and cur not in seen:
-            seen.add(cur)
-            chain.add(cur)
-            cur = (projects[cur].get("parent_project_id", "") or "").strip() or None
-        return chain
 
     for row in samples.rows:
         iid = (row.get("item_id", "") or "").strip()
+        if iid in buried:
+            continue
         patient = (row.get("patient_id", "") or "").strip()
         project = (row.get("project_id", "") or "").strip()
         if not (patient and project):
             continue
-        allowed = memberships.get(patient, set())
-        # Membership at an ancestor of the sample's project counts: a participant
-        # enrolled in 'circa-somatic' is enrolled in its subprojects too.
-        if allowed & ancestors(project):
+        if project in memberships.get(patient, set()):
             continue
         out.append(Violation("samples", iid, "project_id", "project_not_in_patient_projects", "error",
                              f"sample belongs to project {project!r} but patient {patient!r} is not "
-                             "registered under it or any of its ancestors"))
+                             "enrolled in it -- nesting does not inherit, so add the pair with "
+                             "assign_patient_project"))
     return out
 
 
@@ -585,7 +671,7 @@ def _validate_measurements(db: Database) -> list[Violation]:
                                      f"assay {assay.get('code', assay_id)!r} is numeric but value_num is empty"))
         if rtype == "text" and not text:
             out.append(Violation("measurements", mid, "value_text", "missing_text_value", "error",
-                                 f"assay {assay.get('code', assay_id)!r} is textual but value_text is empty"))
+                                 f"assay {assay.get('code', assay_id)!r} is qualitative but value_text is empty"))
         if num and unit:
             quantity = assay.get("quantity", "other")
             if not units.is_known_unit(quantity, unit):

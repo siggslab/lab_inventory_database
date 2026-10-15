@@ -15,7 +15,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-BACKENDS = ("local", "drive_csv", "drive_sheets")
+BACKENDS = ("local", "drive")
+
+#: Backends that existed and what became of them. A stale name in a copied config
+#: otherwise fails as an opaque list of valid options, which tells nobody that the
+#: config is from before a rename rather than mistyped.
+_RETIRED_BACKENDS = {
+    "drive_sheets": "renamed to 'drive' when drive_csv was removed",
+    "drive_csv": "removed; use 'drive'. Storing tables as CSV files in Drive asked "
+                 "Google not to convert them on upload, and it converted them anyway",
+}
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "inventory-mcp" / "config.json"
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "inventory-mcp" / "oauth_token.json"
@@ -28,8 +37,12 @@ TABLES_DIR = "tables"
 EXPORTS_DIR = "exports"
 BACKUPS_DIR = "backups"
 
+# The id sits after a "folder" segment wherever that segment lands in the path, so
+# match the segment rather than its position: plain ``/drive/folders/<id>``, the
+# signed-in ``/drive/u/1/folders/<id>``, and the legacy anchor ``/drive/#folder/<id>``
+# are all one pattern. Pinning the prefix instead made two of those three fail.
 _DRIVE_FOLDER_PATTERNS = (
-    re.compile(r"/drive/(?:folders|drive)/([A-Za-z0-9_-]{10,})"),
+    re.compile(r"[/#]folders?/([A-Za-z0-9_-]{10,})"),
     re.compile(r"[?&]id=([A-Za-z0-9_-]{10,})"),
 )
 
@@ -78,7 +91,7 @@ class Config:
 
     @property
     def is_drive(self) -> bool:
-        return self.backend.startswith("drive_")
+        return self.backend == "drive"
 
     def __post_init__(self) -> None:
         # Normalise at construction, not only on load: `init --drive-folder <URL>`
@@ -94,8 +107,10 @@ class Config:
 
     def validate(self) -> None:
         if self.backend not in BACKENDS:
+            retired = _RETIRED_BACKENDS.get(self.backend)
             raise ConfigError(
                 f"backend must be one of {BACKENDS}, got {self.backend!r}"
+                + (f" -- that backend was {retired}" if retired else "")
             )
         if self.backend == "local" and not self.local_root:
             raise ConfigError("backend 'local' requires local_root")
@@ -119,11 +134,18 @@ class Config:
         known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
         unknown = set(raw) - known
         cfg = cls(**{k: v for k, v in raw.items() if k in known})
-        # Accept a pasted URL anywhere a folder id is expected.
-        if cfg.drive_folder_id:
-            cfg.drive_folder_id = parse_drive_folder(cfg.drive_folder_id)
         cfg.unknown_keys = sorted(unknown)  # type: ignore[attr-defined]
+        # Backend before folder id: a config copied from before a rename should be
+        # told about the rename, not accused of having a bad folder id.
         cfg.validate()
+        # Accept a pasted URL anywhere a folder id is expected. The ValueError has
+        # to become ConfigError -- this runs on a file nobody typed by hand, and
+        # the CLI prints config errors, not tracebacks.
+        if cfg.drive_folder_id:
+            try:
+                cfg.drive_folder_id = parse_drive_folder(cfg.drive_folder_id)
+            except ValueError as exc:
+                raise ConfigError(f"drive_folder_id: {exc}") from exc
         return cfg
 
     def to_dict(self) -> dict[str, Any]:

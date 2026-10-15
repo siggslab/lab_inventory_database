@@ -29,6 +29,11 @@ inventory-mcp = "inventory_mcp.cli:main"
 [tool.setuptools.packages.find]
 include = ["inventory_mcp*"]
 
+[tool.setuptools.package-data]
+# The lab's OAuth client, which auth falls back to when the user has no copy of
+# their own. Without this it lives in a checkout but vanishes from a wheel.
+inventory_mcp = ["client_secret.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

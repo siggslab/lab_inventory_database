@@ -1,7 +1,7 @@
-"""Drive backends exercised against a fake Drive/Sheets service.
+"""The Drive backend exercised against a fake Drive/Sheets service.
 
-No network, no credentials. The point is to get the awkward paths -- conversion,
-coercion, revision conflicts, shrink-trim, missing tabs -- right in front of a
+No network, no credentials. The point is to get the awkward paths -- coercion,
+revision conflicts, shrink-trim, missing tabs -- right in front of a
 deterministic stand-in, so that the first time they run against a real folder they
 are being *verified* rather than discovered.
 
@@ -19,11 +19,14 @@ import pytest
 from inventory_mcp.config import Config
 from inventory_mcp.store.base import RevisionConflict, StoreError, compute_revision
 from inventory_mcp.store.drive import (
-    DriveCsvStore,
     DriveSheetsStore,
     _column_letter,
     _from_sheet,
 )
+
+#: What a table is under this backend: one Google spreadsheet each, not a file
+#: anyone opens as text.
+SHEET = "application/vnd.google-apps.spreadsheet"
 
 
 class HttpErr(Exception):
@@ -73,6 +76,8 @@ class FakeDrive:
         self.fail_next: list[Exception] = []
         #: errors raised on every call, for the case that never clears
         self.always_fail: list[Exception] = []
+        #: every files() call and its kwargs, to assert what was asked for
+        self.calls: list[tuple[str, dict]] = []
 
     def new_id(self) -> str:
         self.next_id += 1
@@ -110,19 +115,15 @@ class _Files:
         return FakeRequest(run)
 
     def list(self, q="", fields="", pageSize=1000, **kw):
+        self.d.calls.append(("files.list", kw))
         parent = q.split("'")[1]
         return self._guard(lambda: {"files": [
             {k: v for k, v in f.items() if k in ("id", "name", "mimeType")}
             for f in self.d.by_id.values() if f["parent"] == parent
         ]})
 
-    def get_media(self, fileId):
-        entry = self.d.by_id[fileId]
-        # The real client's execute() returns raw bytes, not a stream -- a fake
-        # that returns BytesIO hides itself from exactly this live bug.
-        return self._guard(lambda: entry["content"])
-
     def create(self, body=None, media_body=None, fields="", **kw):
+        self.d.calls.append(("files.create", kw))
         data = media_bytes(media_body)
         mime = (body or {}).get("mimeType", "")
 
@@ -136,7 +137,7 @@ class _Files:
                 "parent": (body.get("parents") or ["root"])[0],
                 "sheet": None,
             }
-            if mime == "application/vnd.google-apps.spreadsheet":
+            if mime == SHEET:
                 entry["sheet"] = FakeSheet()
                 entry["content"] = b""
             self.d.by_id[fid] = entry
@@ -256,7 +257,7 @@ def drive():
 @pytest.fixture
 def config():
     # ttl 0 => no caching, so every assertion observes the shared fake state
-    return Config(backend="drive_sheets", drive_folder_id="FOLDERID", actor="tester",
+    return Config(backend="drive", drive_folder_id="FOLDERID", actor="tester",
                   cache_ttl_seconds=0)
 
 
@@ -291,85 +292,24 @@ class TestHelpers:
         assert _from_sheet(10) == "10"
         assert _from_sheet(True) == "true"
         assert _from_sheet(None) == ""
-        assert _from_sheet("2024-05-16T11:00:00") == "2024-05-16T11:00"
+        assert _from_sheet("2024-05-16T11:00:00") == "2024-05-16T11:00Z"
         # a locale-formatted date is left alone for the validator to flag, not guessed
         assert _from_sheet("5/16/2024, 11:00:00 AM") == "5/16/2024, 11:00:00 AM"
 
     def test_ttl_zero_means_no_caching(self, config, drive):
-        drive.add("items.csv", content=b"item_id\nsmp_aaaaaaaa\n")
-        store = make_store(DriveCsvStore, config, drive)
+        store = sheets_store(config, drive)
+        store.write_table("items", ("item_id",), [{"item_id": "smp_aaaaaaaa"}], None)
         assert len(store.read_table("items").rows) == 1
-        drive.by_id[next(iter(drive.by_id))]["content"] = (
-            b"item_id\nsmp_aaaaaaaa\nsmp_bbbbbbbb\n"
-        )
+        drive.only()["sheet"].tabs["items"].append(["smp_bbbbbbbb"])
         assert len(store.read_table("items").rows) == 2
 
     def test_ttl_positive_serves_the_cache(self, drive):
-        cfg = Config(backend="drive_csv", drive_folder_id="FOLDERID", cache_ttl_seconds=60)
-        drive.add("items.csv", content=b"item_id\nsmp_aaaaaaaa\n")
-        store = make_store(DriveCsvStore, cfg, drive)
+        cfg = Config(backend="drive", drive_folder_id="FOLDERID", cache_ttl_seconds=60)
+        store = sheets_store(cfg, drive)
+        store.write_table("items", ("item_id",), [{"item_id": "smp_aaaaaaaa"}], None)
         assert len(store.read_table("items").rows) == 1
-        drive.by_id[next(iter(drive.by_id))]["content"] = (
-            b"item_id\nsmp_aaaaaaaa\nsmp_bbbbbbbb\n"
-        )
+        drive.only()["sheet"].tabs["items"].append(["smp_bbbbbbbb"])
         assert len(store.read_table("items").rows) == 1, "within TTL the cache answers"
-
-
-class TestDriveCsv:
-    def test_create_then_round_trip(self, config, drive):
-        store = make_store(DriveCsvStore, config, drive)
-        header = ("item_id", "name")
-        rows = [{"item_id": "smp_aaaaaaaa", "name": "one"},
-                {"item_id": "smp_bbbbbbbb", "name": "two"}]
-        rev = store.write_table("items", header, rows, None)
-        assert store.exists("items")
-        data = store.read_table("items")
-        assert [r["name"] for r in data.rows] == ["one", "two"]
-        assert data.revision == rev == compute_revision(header, rows)
-
-    def test_mime_type_is_declared_so_drive_does_not_convert(self, config, drive):
-        store = make_store(DriveCsvStore, config, drive)
-        store.write_table("items", ("item_id",), [{"item_id": "smp_aaaaaaaa"}], None)
-        assert drive.only()["mimeType"] == "text/csv"
-
-    def test_native_file_where_csv_expected_is_refused_not_converted(self, config, drive):
-        drive.add("items.csv", mime="application/vnd.google-apps.spreadsheet")
-        store = make_store(DriveCsvStore, config, drive)
-        with pytest.raises(StoreError, match="Google-native"):
-            store.read_table("items")
-
-    def test_stale_revision_aborts_before_writing(self, config, drive):
-        store = make_store(DriveCsvStore, config, drive)
-        header = ("item_id",)
-        store.write_table("items", header, [{"item_id": "smp_aaaaaaaa"}], None)
-        other = make_store(DriveCsvStore, config, drive)
-        mine = other.read_table("items").revision
-        store.write_table("items", header, [{"item_id": "smp_bbbbbbbb"}], None)
-        with pytest.raises(RevisionConflict) as e:
-            other.write_table("items", header, [{"item_id": "smp_cccccccc"}], mine)
-        assert "browser" in str(e.value) or "another session" in str(e.value)
-        # the other writer's content survived the abort
-        assert store.read_table("items").rows[0]["item_id"] == "smp_bbbbbbbb"
-
-    def test_transient_errors_are_retried(self, config, drive):
-        store = make_store(DriveCsvStore, config, drive)
-        drive.fail_next = [HttpErr(429)]
-        assert store.write_table("items", ("item_id",), [{"item_id": "smp_aaaaaaaa"}], None)
-
-    def test_permanent_error_becomes_a_readable_store_error(self, config, drive):
-        store = make_store(DriveCsvStore, config, drive)
-        drive.always_fail = [HttpErr(403, "Insufficient Permission")]
-        with pytest.raises(StoreError, match="view-only|cannot write"):
-            store.write_table("items", ("item_id",), [{"item_id": "smp_aaaaaaaa"}], None)
-
-    def test_deleted_file_is_not_resurrected_by_an_update(self, config, drive):
-        store = make_store(DriveCsvStore, config, drive)
-        store.write_table("items", ("item_id",), [{"item_id": "smp_aaaaaaaa"}], None)
-        rev = store.current_revision("items")
-        drive.by_id.clear()
-        store.invalidate()
-        with pytest.raises(RevisionConflict, match="no Drive file"):
-            store.write_table("items", ("item_id",), [{"item_id": "smp_bbbbbbbb"}], rev)
 
 
 class TestDriveSheets:
@@ -390,7 +330,7 @@ class TestDriveSheets:
         assert store.read_table("measurements").rows[0]["value_num"] == "47.2"
 
     def test_integer_cells_do_not_grow_a_spurious_decimal(self, config, drive):
-        drive.add("containers", mime="application/vnd.google-apps.spreadsheet",
+        drive.add("containers", mime=SHEET,
                   sheet=FakeSheet())
         store = sheets_store(config, drive)
         drive.only()["sheet"].tabs["containers"] = [["container_id", "rows"],
@@ -409,7 +349,7 @@ class TestDriveSheets:
         assert store.read_table("items").revision == rev
 
     def test_missing_tab_reads_as_empty_not_error(self, config, drive):
-        drive.add("items", mime="application/vnd.google-apps.spreadsheet",
+        drive.add("items", mime=SHEET,
                   sheet=FakeSheet())
         store = sheets_store(config, drive)
         data = store.read_table("items")
@@ -439,7 +379,7 @@ class TestDriveSheets:
 
     def test_extra_columns_survive_a_read(self, config, drive):
         """Someone added a column by hand; it must be visible, not dropped."""
-        drive.add("items", mime="application/vnd.google-apps.spreadsheet",
+        drive.add("items", mime=SHEET,
                   sheet=FakeSheet())
         store = sheets_store(config, drive)
         drive.only()["sheet"].tabs["items"] = [
@@ -447,6 +387,38 @@ class TestDriveSheets:
         ]
         data = store.read_table("items")
         assert data.rows[0]["notes_backup"] == "typed in the browser"
+
+    def test_every_drive_call_asks_about_shared_drives(self, config, drive):
+        """Production lives in a shared drive, where a request that doesn't pass
+        supportsAllDrives is answered with 404 -- precisely what a deleted table
+        looks like. So it has to be every call, not the ones that look relevant."""
+        store = sheets_store(config, drive)
+        store.write_table("items", ("item_id",), [{"item_id": "smp_aaaaaaaa"}], None)
+        store.invalidate()
+        store.read_table("items")
+        assert drive.calls, "expected the folder to have been listed"
+        blind = [name for name, kw in drive.calls if not kw.get("supportsAllDrives")]
+        assert not blind, f"these would 404 in a shared drive: {blind}"
+
+    def test_transient_errors_are_retried(self, config, drive):
+        store = sheets_store(config, drive)
+        drive.fail_next = [HttpErr(429)]
+        assert store.write_table("items", ("item_id",), [{"item_id": "smp_aaaaaaaa"}], None)
+
+    def test_permanent_error_becomes_a_readable_store_error(self, config, drive):
+        store = sheets_store(config, drive)
+        drive.always_fail = [HttpErr(403, "Insufficient Permission")]
+        with pytest.raises(StoreError, match="view-only|cannot write"):
+            store.write_table("items", ("item_id",), [{"item_id": "smp_aaaaaaaa"}], None)
+
+    def test_deleted_file_is_not_resurrected_by_an_update(self, config, drive):
+        store = sheets_store(config, drive)
+        store.write_table("items", ("item_id",), [{"item_id": "smp_aaaaaaaa"}], None)
+        rev = store.current_revision("items")
+        drive.by_id.clear()
+        store.invalidate()
+        with pytest.raises(RevisionConflict, match="no Drive file"):
+            store.write_table("items", ("item_id",), [{"item_id": "smp_bbbbbbbb"}], rev)
 
 
 class TestThroughTheService:
@@ -460,7 +432,7 @@ class TestThroughTheService:
         from inventory_mcp.initdb import init_database
         from inventory_mcp.seed import seed
 
-        cfg = Config(backend="drive_sheets", drive_folder_id="FOLDERID", actor="tester",
+        cfg = Config(backend="drive", drive_folder_id="FOLDERID", actor="tester",
                      cache_ttl_seconds=0)
         store = sheets_store(cfg, drive)
         svc, created = init_database(cfg, store=store)
@@ -471,27 +443,16 @@ class TestThroughTheService:
         assert report["error_count"] == 0, report["errors"]
         assert report["table_counts"]["measurements"] == 18
 
-    def test_init_and_seed_over_csv(self, drive):
-        from inventory_mcp.initdb import init_database
-        from inventory_mcp.seed import seed
-
-        cfg = Config(backend="drive_csv", drive_folder_id="FOLDERID", actor="tester",
-                     cache_ttl_seconds=0)
-        store = make_store(DriveCsvStore, cfg, drive)
-        svc, _ = init_database(cfg, store=store)
-        seed(svc)
-        assert svc.doctor()["error_count"] == 0, svc.doctor()["errors"]
-
     def test_reads_and_aggregates_work_after_seeding(self, drive):
         from inventory_mcp.initdb import init_database
         from inventory_mcp.seed import seed
         from inventory_mcp.service import Service
 
-        cfg = Config(backend="drive_sheets", drive_folder_id="FOLDERID", actor="tester",
+        cfg = Config(backend="drive", drive_folder_id="FOLDERID", actor="tester",
                      cache_ttl_seconds=0)
         svc, _ = init_database(cfg, store=sheets_store(cfg, drive))
         seed(svc)
-        present = svc.search_items(item_class="sample", status="present")
+        present = svc.search_items(item_class="sample", status="present")["rows"]
         assert present
         boxes = [c for c in svc._occupancy_rows() if c["has_capacity"]]
         assert all(b["occupied"] <= b["capacity"] for b in boxes)
@@ -502,7 +463,7 @@ class TestThroughTheService:
         """Snapshots need a directory; Drive's own version history is the fallback."""
         from inventory_mcp.initdb import init_database
 
-        cfg = Config(backend="drive_sheets", drive_folder_id="FOLDERID", actor="tester",
+        cfg = Config(backend="drive", drive_folder_id="FOLDERID", actor="tester",
                      cache_ttl_seconds=0)
         svc, _ = init_database(cfg, store=sheets_store(cfg, drive))
         result = svc.create_sample("Remote tube", "dna")
@@ -512,7 +473,7 @@ class TestThroughTheService:
         from inventory_mcp.initdb import init_database
         from inventory_mcp.service import Conflict
 
-        cfg = Config(backend="drive_sheets", drive_folder_id="FOLDERID", actor="tester",
+        cfg = Config(backend="drive", drive_folder_id="FOLDERID", actor="tester",
                      cache_ttl_seconds=0)
         store = sheets_store(cfg, drive)
         svc, _ = init_database(cfg, store=store)
@@ -543,7 +504,7 @@ class TestThroughTheService:
         from inventory_mcp.initdb import init_database
         from inventory_mcp.service import Conflict
 
-        cfg = Config(backend="drive_sheets", drive_folder_id="FOLDERID", actor="tester",
+        cfg = Config(backend="drive", drive_folder_id="FOLDERID", actor="tester",
                      cache_ttl_seconds=0)
         store = sheets_store(cfg, drive)
         svc, _ = init_database(cfg, store=store)
@@ -559,28 +520,28 @@ class TestThroughTheService:
 
 class TestFolderResolution:
     def test_only_files_in_the_named_folder_count(self, config, drive):
-        drive.add("items.csv")
-        drive.add("samples.csv", parent="somewhere_else")
-        store = make_store(DriveCsvStore, config, drive)
+        drive.add("items", mime=SHEET, sheet=FakeSheet())
+        drive.add("samples", mime=SHEET, sheet=FakeSheet(), parent="somewhere_else")
+        store = sheets_store(config, drive)
         assert store.list_tables() == ["items"]
         assert store.stray_objects() == []
 
     def test_unrelated_files_are_reported_as_strays(self, config, drive):
-        drive.add("items.csv")
-        drive.add("old_airtable_export.csv")
-        store = make_store(DriveCsvStore, config, drive)
-        assert store.stray_objects() == ["old_airtable_export.csv"]
+        drive.add("items", mime=SHEET, sheet=FakeSheet())
+        drive.add("old_airtable_export")
+        store = sheets_store(config, drive)
+        assert store.stray_objects() == ["old_airtable_export"]
 
     def test_explicit_file_id_override_wins(self, drive):
-        cfg = Config(backend="drive_csv", drive_folder_id="FOLDERID",
+        cfg = Config(backend="drive", drive_folder_id="FOLDERID",
                      drive_file_ids={"items": "fid2"}, cache_ttl_seconds=0)
-        drive.add("whatever-we-call-it.csv", content=b"item_id\nsmp_aaaaaaaa\n")
-        store = make_store(DriveCsvStore, cfg, drive)
+        drive.add("whatever-we-call-it", mime=SHEET, sheet=FakeSheet())
+        store = sheets_store(cfg, drive)
         assert store.file_id("items") == "fid2"
         assert "items" in store.list_tables()
 
     def test_folder_id_from_a_pasted_url(self):
-        cfg = Config(backend="drive_sheets",
+        cfg = Config(backend="drive",
                      drive_folder_id="https://drive.google.com/drive/folders/"
                                       "1AbCdEfGhIjKlMnOpQrStUvWxYz")
         assert cfg.drive_folder_id == "1AbCdEfGhIjKlMnOpQrStUvWxYz"

@@ -19,25 +19,35 @@ from .db import Database
 
 _FORBIDDEN = re.compile(
     r"\b(insert|update|delete|drop|alter|create|attach|detach|pragma|vacuum|"
-    r"reindex|savepoint|begin|commit|rollback|replace)\b",
+    r"reindex|savepoint|begin|commit|rollback)\b|\breplace\s+into\b",
     re.IGNORECASE,
 )
 _ALLOWED_START = re.compile(r"^\s*(select|with)\b", re.IGNORECASE)
+
+# Quoted text and comments are data and prose, not structure: ``where notes like
+# '%update%'`` describes a tube, not a statement. Blanked before the scan so the
+# keyword rules read the statement's shape. The original text is what executes.
+_NON_CODE = re.compile(
+    r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|--[^\n]*|/\*.*?\*/", re.DOTALL
+)
 
 
 class QueryError(RuntimeError):
     pass
 
 
-def run_sql(db: Database, sql: str, limit: int = 500) -> dict[str, Any]:
+def run_sql(db: Database, sql: str, limit: int = 500, offset: int = 0) -> dict[str, Any]:
     text = sql.strip().rstrip(";").strip()
     if not text:
         raise QueryError("empty query")
-    if ";" in text:
+    if offset < 0:
+        raise QueryError(f"offset must be 0 or more, got {offset}")
+    shape = _NON_CODE.sub(" ", text)
+    if ";" in shape:
         raise QueryError("only one statement per query")
-    if not _ALLOWED_START.match(text):
+    if not _ALLOWED_START.match(shape):
         raise QueryError("only SELECT or WITH queries are permitted")
-    if _FORBIDDEN.search(text):
+    if _FORBIDDEN.search(shape):
         raise QueryError("query contains a statement that would modify data")
 
     conn = sqlite3.connect(":memory:")
@@ -51,14 +61,16 @@ def run_sql(db: Database, sql: str, limit: int = 500) -> dict[str, Any]:
             hint = _unknown_table_hint(str(e), allowed)
             raise QueryError(f"{e}{hint}") from e
         columns = [d[0] for d in (cursor.description or [])]
-        rows = [dict(zip(columns, r)) for r in cursor.fetchmany(limit + 1)]
-        truncated = len(rows) > limit
+        # One row past the window is fetched rather than counted, so ``truncated`` says
+        # whether another page exists instead of merely that this one came back full.
+        rows = [dict(zip(columns, r))
+                for r in cursor.fetchmany(offset + limit + 1)][offset:]
         return {
             "columns": columns,
             "rows": rows[:limit],
             "returned": min(len(rows), limit),
-            "truncated": truncated,
-            "tables_available": sorted(allowed),
+            "offset": offset,
+            "truncated": len(rows) > limit,
         }
     finally:
         conn.close()
@@ -79,6 +91,14 @@ def _materialise(conn: sqlite3.Connection, db: Database) -> None:
             [[_clean(r.get(c, "")) for c in cols] for r in table.rows],
         )
     # Convenience views so consumers do not have to re-derive the joins.
+    #
+    # ``latest_measurements`` copies the service's rule rather than inventing a
+    # second one: a reading named by someone's ``supersedes`` is retired, and of
+    # what remains, the last row written for that item and assay is the current
+    # one. Entry order decides, not ``measured_on`` -- a correction typed late is
+    # authoritative precisely because it was typed late. The old definition
+    # stopped at the retirement rule, so two readings of one assay both looked
+    # current here while every tool call reported a single value.
     conn.executescript(
         """
         CREATE VIEW IF NOT EXISTS items_wide AS
@@ -100,6 +120,13 @@ def _materialise(conn: sqlite3.Connection, db: Database) -> None:
         FROM measurements m
         WHERE NOT EXISTS (
             SELECT 1 FROM measurements n WHERE n.supersedes = m.measurement_id
+        )
+        AND m.rowid = (
+            SELECT MAX(n.rowid) FROM measurements n
+            WHERE n.item_id = m.item_id AND n.assay_id = m.assay_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM measurements x WHERE x.supersedes = n.measurement_id
+              )
         );
         """
     )

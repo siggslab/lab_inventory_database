@@ -17,7 +17,16 @@ client_secret*.json
 service_account*.json
 oauth_token.json
 
+# The one exception: the lab's own OAuth *client*, shipped inside the package so a
+# fresh install can run `auth` at all. An installed-app client secret grants nothing
+# by itself -- consent is still a human in a browser -- and Google expects it to
+# travel with the app. A user's token is a different thing and stays out.
+!inventory_mcp/client_secret.json
+
 # Legacy Airtable snapshot (the Drive download), kept locally for schema
 # reference only. Real participant data — must never reach a git remote.
 drive-download-*/
 drive-download-*.zip
+
+# per-machine config: credential paths and which folder is yours
+.devdb.config.json

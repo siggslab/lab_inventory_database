@@ -1,24 +1,24 @@
-"""Google Drive backends.
+"""The Google Drive backend.
 
-Two shapes of the same promise: the files in one Drive folder are the database,
-addressed by table name, readable by a human who double-clicks them.
+The files in one Drive folder are the database: one spreadsheet per table, one tab
+per table, addressed by table name, readable by a human who double-clicks them.
 
-``drive_csv``     one CSV file per table. Strictest, closest to the local backend,
-                  but see the conversion warning below.
-``drive_sheets``  one spreadsheet per table, one tab per table. What people
-                  actually open in a browser.
-
-Both address tables by *name* and resolve to file ids lazily, because ids change
+Tables are addressed by *name* and resolved to file ids lazily, because ids change
 when a file is replaced and names are what the schema declares. ``drive_file_ids``
 in the config overrides the lookup for the case where someone renames a file or a
 name collides with something else in the folder.
 
-Three hazards specific to Drive, and what this module does about each:
+Four hazards specific to Drive, and what this module does about each:
 
-*Conversion.* Uploading text/csv without declaring a mimeType makes Drive create a
-Google Sheet instead, and the file id changes shape under you. Every create here
-declares its mimeType explicitly, and reads refuse a native file where a CSV was
-expected rather than exporting a copy nobody asked for.
+*Mime type.* Anything uploaded without declaring what it is gets converted into a
+Google-native file, which then answers to different API calls than the one that
+wrote it. Every create here states its mimeType. A backend that stored tables as
+plain CSV files in the folder existed once, for the sake of strictness, and spent
+its read path detecting that Drive had converted the files anyway; it is gone.
+
+*Shared drives.* A file inside one is reported as **not found** unless the request
+passes ``supportsAllDrives``, which is indistinguishable from a deleted table. The
+flag is on every Drive call for that reason; production lives in a shared drive.
 
 *Coercion.* Sheets rewrites what it thinks it understands -- ``47.2`` becomes a
 number, ``2024-05-16T11:00`` can become a date cell. Values are written RAW and
@@ -38,16 +38,13 @@ is reported by ``describe()`` rather than hidden.
 
 from __future__ import annotations
 
-import csv
-import io
 import re
 import time
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 from .. import schema
 from ..auth import AuthError, drive_service, sheets_service
 from .base import (
-    EXTRA_COLUMNS_KEY,
     Row,
     RevisionConflict,
     StoreError,
@@ -61,14 +58,18 @@ try:  # optional extra
 except ImportError:  # pragma: no cover
     HttpError = None  # type: ignore[assignment]
 
-RESTKEY = EXTRA_COLUMNS_KEY
 _RETRY_STATUS = {429, 500, 502, 503, 504}
-_NATIVE = "application/vnd.google-apps"
 
-#: Sheets widens our minute-precision timestamps to whole seconds. Undoing that is
-#: safe because the shape is unambiguously ours; a locale-formatted date is not, and
-#: is left for the validator to flag rather than be guessed at.
-_ISO_WITH_SECONDS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}):\d{2}$")
+#: Sheets widens our minute-precision timestamps to whole seconds and sometimes drops or
+#: re-adds the zone marker. Undoing that is safe because the shape is unambiguously ours;
+#: a locale-formatted date is not, and is left for the validator to flag rather than be
+#: guessed at. The rendering always comes back as the stored spelling: UTC to the minute
+#: with ``Z``, which is what every write emits.
+_SHEET_TIMESTAMP_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})(?::\d{2})?(?:\.0+)?"
+    r"(?:\s*(?:Z|UTC|\+00:?00))?$",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -289,30 +290,6 @@ def _short(rev: Optional[str]) -> str:
     return (rev or "<absent>")[-8:]
 
 
-def _parse_csv(text: str, name: str) -> TableData:
-    reader = csv.DictReader(io.StringIO(text), restkey=RESTKEY, restval="")
-    header = tuple(reader.fieldnames or ())
-    rows: list[Row] = []
-    for raw in reader:
-        row: Row = {k: (v if v is not None else "") for k, v in raw.items() if k != RESTKEY}
-        extra = raw.get(RESTKEY)
-        if extra:
-            row[RESTKEY] = "|".join("" if c is None else c for c in extra)
-        rows.append(row)
-    return TableData(name=name, header=header, rows=tuple(rows),
-                     revision=compute_revision(header, rows))
-
-
-def render_csv(header: Iterable[str], rows: Iterable[Row]) -> bytes:
-    buf = io.StringIO()
-    cols = list(header)
-    writer = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore", lineterminator="\n")
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({c: _text(row.get(c, "")) for c in cols})
-    return buf.getvalue().encode("utf-8")
-
-
 def _text(value: Any) -> str:
     if value is None:
         return ""
@@ -322,74 +299,17 @@ def _text(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# drive_csv
-# ---------------------------------------------------------------------------
-
-
-class DriveCsvStore(DriveStoreBase):
-    """One CSV file per table -- the closest thing to the local backend remotely."""
-
-    kind = "drive_csv"
-
-    def object_name(self, spec) -> str:
-        return spec.filename
-
-    def _fetch(self, name: str) -> TableData:
-        fid = self.file_id(name)
-        if fid is None:
-            raise StoreError(f"table {name!r} has no file in the Drive folder")
-        entry = self._list_folder().get(self.object_name(schema.get_table(name)), {})
-        if str(entry.get("mimeType", "")).startswith(_NATIVE):
-            raise StoreError(
-                f"{self.object_name(schema.get_table(name))} is a Google-native file "
-                f"({entry.get('mimeType')}), not a CSV. Drive converted it on upload. "
-                "Either switch this database to backend='drive_sheets' or re-create "
-                "it as CSV."
-            )
-        # execute() hands back the body as plain bytes; there is no stream
-        # object unless a custom http transport is injected (observed live).
-        blob = self._retry(self._drive.files().get_media(fileId=fid))
-        text = blob.decode("utf-8-sig")
-        return _parse_csv(text, name)
-
-    def _push(self, name: str, header: tuple[str, ...], rows: list[Row]) -> str:
-        from googleapiclient.http import MediaIoBaseUpload
-
-        data = render_csv(header, rows)
-        fname = self.object_name(schema.get_table(name))
-        buf = io.BytesIO(data)
-        media = MediaIoBaseUpload(buf, mimetype="text/csv", chunksize=len(data) or 1,
-                                  resumable=False)
-        fid = self.file_id(name)
-        if fid is None:
-            body = {"name": fname, "mimeType": "text/csv", "parents": [self.folder_id]}
-            created = self._retry(
-                self._drive.files().create(body=body, media_body=media,
-                                           fields="id", supportsAllDrives=True)
-            )
-            self.invalidate()
-            return compute_revision(header, rows)
-        self._retry(
-            self._drive.files().update(fileId=fid, body={"name": fname},
-                                       media_body=media, supportsAllDrives=True)
-        )
-        self._listing = None
-        return compute_revision(header, rows)
-
-
-# ---------------------------------------------------------------------------
-# drive_sheets
+# drive
 # ---------------------------------------------------------------------------
 
 
 class DriveSheetsStore(DriveStoreBase):
     """One spreadsheet per table, one tab per table.
 
-    Named without a ``.csv`` suffix because it is not a CSV; the tab is named after
-    the table so a person opening the file sees ``items`` rather than ``Sheet1``.
+    Named without an extension because a spreadsheet is not a file anyone will open
+    as text; the tab is named after the table so a person opening the file sees
+    ``items`` rather than ``Sheet1``.
     """
-
-    kind = "drive_sheets"
 
     def __init__(self, config):
         super().__init__(config)
@@ -571,9 +491,10 @@ def _from_sheet(value: Any) -> str:
     """Stringify a cell the way our CSV would hold it.
 
     Numbers come back as int/float and would otherwise print as ``47.2`` or the
-    unwanted ``500.0``; timestamps come back widened to seconds, which is our own
-    format stretched by Sheets and safe to shorten. Locale-formatted dates are
-    deliberately left as-is so validation reports them instead of guessing.
+    unwanted ``500.0``; timestamps come back widened to seconds and sometimes stripped
+    of their zone marker, which is our own format stretched by Sheets and safe to
+    re-render. Locale-formatted dates are deliberately left as-is so validation reports
+    them instead of guessing.
     """
     if value is None:
         return ""
@@ -584,7 +505,7 @@ def _from_sheet(value: Any) -> str:
     if isinstance(value, float):
         return str(int(value)) if value.is_integer() else repr(value)
     text = str(value).strip()
-    widened = _ISO_WITH_SECONDS_RE.match(text)
+    widened = _SHEET_TIMESTAMP_RE.match(text)
     if widened:
-        return f"{widened.group(1)}T{widened.group(2)}"
+        return f"{widened.group(1)}T{widened.group(2)}Z"
     return text

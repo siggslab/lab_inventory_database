@@ -131,7 +131,7 @@ class TestSpatialRules:
         from inventory_mcp.service import ValidationError
 
         with pytest.raises(ValidationError) as e:
-            seeded.move_item(other, location_id=box, position=items[target]["position"])
+            seeded.move(other, box, position=items[target]["position"])
         assert "double_booked_well" in codes(e.value.violations)
 
     def test_position_outside_declared_geometry(self, svc, seeded):
@@ -141,7 +141,7 @@ class TestSpatialRules:
         from inventory_mcp.service import ValidationError
 
         with pytest.raises(ValidationError) as e:
-            seeded.move_item(sample, location_id=box["container_id"], position="Z20")
+            seeded.move(sample, box["container_id"], position="Z20")
         assert "bad_position" in codes(e.value.violations)
 
     def test_custom_row_labels_are_honoured(self, seeded):
@@ -152,6 +152,22 @@ class TestSpatialRules:
         problem = validation.validate_position("I5", container)
         assert problem and "does not exist" in problem
         assert validation.validate_position("M8", container) is None
+
+    def test_the_refusal_lists_the_rows_that_actually_exist(self, seeded):
+        """Saying "rows are A..M" about a grid with no I pointed at the very row the
+        caller reached for, which sent them back to the same well. An overridden axis is
+        spelled out; only a plain run gets the compact form."""
+        box = next(c for c in seeded.list_containers(kind="box") if c["geometry"] == "12x8")
+        container = seeded.db.containers_by_id()[box["container_id"]]
+        problem = validation.validate_position("I5", container)
+        assert "rows are A, B, C, D, E, F, G, H, J, K, L, M" in problem
+        assert ".." not in problem
+
+    def test_a_plain_axis_still_reads_as_a_range(self):
+        grid = {"rows": "9", "cols": "9"}
+        problem = validation.validate_position("K1", grid)
+        assert problem == ("position 'K1' uses row 'K', which does not exist in this "
+                           "container (rows are A..I)")
 
     def test_container_cycle_detected(self, svc, root):
         write_rows(
@@ -230,8 +246,7 @@ class TestBusinessRules:
 
     def test_project_outside_the_patient_enrolments_blocks_write(self, seeded):
         # HC is enrolled in CIRCA somatic only. GeneAdd registry is an unrelated
-        # root project, so a HC sample filed there must be refused. (VEXAS would
-        # not be: it is a child of CIRCA, covered by the ancestor rule below.)
+        # root project, so a HC sample filed there must be refused.
         hc = next(p["patient_id"] for p in seeded.db.t("patients").rows
                   if p["label"] == "HC_99801143")
         geneadd = next(p["project_id"] for p in seeded.db.t("projects").rows
@@ -242,18 +257,32 @@ class TestBusinessRules:
             seeded.create_sample("mislabelled", "dna", patient_id=hc, project_id=geneadd)
         assert "project_not_in_patient_projects" in codes(e.value.violations)
 
-    def test_membership_at_an_ancestor_satisfies_the_rule(self, seeded):
+    def test_membership_at_an_ancestor_does_not_reach_a_subproject(self, seeded):
+        """The project tree organises work; it is not a record of consent. Enrolling
+        someone in a parent says nothing about its children, so widening their scope
+        stays an explicit act rather than something a folder does on its own."""
         hc = next(p["patient_id"] for p in seeded.db.t("patients").rows
                   if p["label"] == "HC_99801143")
-        circa = next(p["project_id"] for p in seeded.db.t("projects").rows
-                     if p["name"] == "CIRCA somatic")
-        stat5b = next(p["project_id"] for p in seeded.db.t("projects").rows
-                      if p["name"] == "STAT5B/KRAS")
-        # JaCo sits under STAT5B/KRAS whose parent CIRCA is where she is enrolled
-        jacobs = next(s["patient_id"] for s in seeded.db.t("samples").rows
-                      if s.get("patient_id"))
-        seeded.create_sample("fine", "dna", patient_id=jacobs, project_id=stat5b)
-        seeded.create_sample("also fine", "dna", patient_id=hc, project_id=circa)
+        vexas = next(p["project_id"] for p in seeded.db.t("projects").rows
+                     if p["name"] == "VEXAS")
+        from inventory_mcp.service import ValidationError
+
+        with pytest.raises(ValidationError) as e:
+            seeded.create_sample("inherited", "dna", patient_id=hc, project_id=vexas)
+        bad = [v for v in e.value.violations if v.code == "project_not_in_patient_projects"]
+        assert len(bad) == 1
+        assert "does not inherit" in bad[0].message
+        assert "assign_patient_project" in bad[0].message, "the refusal should name the fix"
+
+    def test_a_pair_written_explicitly_is_enough_however_deep(self, seeded):
+        """Depth is not the issue; the missing row is. Give VEXAS its own enrolment
+        and the same sample files without complaint."""
+        hc = next(p["patient_id"] for p in seeded.db.t("patients").rows
+                  if p["label"] == "HC_99801143")
+        vexas = next(p["project_id"] for p in seeded.db.t("projects").rows
+                     if p["name"] == "VEXAS")
+        seeded.assign_patient_project(hc, vexas)
+        seeded.create_sample("filed", "dna", patient_id=hc, project_id=vexas)
         assert seeded.doctor()["error_count"] == 0
 
     def test_ambiguous_date_is_reported_not_guessed(self, svc, root):

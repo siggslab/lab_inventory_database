@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import SCHEMA_VERSION, __version__
 from .auth import AuthError
-from .config import Config, ConfigError
+from .config import BACKENDS, Config, ConfigError
 from .service import Service, ServiceError
 from .store.base import StoreError
 
@@ -23,6 +23,9 @@ from .store.base import StoreError
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    # The flags only exist on `init`, so reading them plainly raises AttributeError
+    # for every other subcommand -- including `serve`, which is the product.
+    assert not (getattr(args, "seed", False) or getattr(args, "reset", False)), "Seed and reset are destructive flags that must first be manually enabled in the code"
     try:
         return args.func(args)
     except ConfigError as e:
@@ -48,7 +51,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="create the table files")
-    init.add_argument("--backend", default="local", choices=("local", "drive_csv", "drive_sheets"))
+    init.add_argument("--backend", default="local", choices=BACKENDS)
     init.add_argument("--root", help="directory for tables/ exports/ backups/")
     init.add_argument("--drive-folder", help="Drive folder id or URL")
     init.add_argument("--seed", action="store_true", help="fill with development fixture data")
@@ -91,6 +94,8 @@ def _build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("query", help="read-only SQL against the database")
     q.add_argument("sql")
     q.add_argument("--limit", type=int, default=200)
+    q.add_argument("--offset", type=int, default=0,
+                   help="rows to skip, to page past --limit")
     q.set_defaults(func=_cmd_query)
 
     ls = sub.add_parser("ls", help="list items or containers")
@@ -103,6 +108,16 @@ def _build_parser() -> argparse.ArgumentParser:
     occ.add_argument("container_id", nargs="?", default="")
     occ.add_argument("--kind", default="", help="filter to one container kind")
     occ.set_defaults(func=_cmd_occupancy)
+
+    enrol = sub.add_parser(
+        "enrol",
+        help="give each sample's pairing its own enrolment row (migration from inherited scope)",
+    )
+    enrol.add_argument("--from-ancestors", action="store_true", dest="from_ancestors",
+                       help="add a row for every sample whose participant is enrolled only in "
+                            "an ancestor of that project")
+    enrol.add_argument("--dry-run", action="store_true", help="report the plan, change nothing")
+    enrol.set_defaults(func=_cmd_enrol)
 
     schema_cmd = sub.add_parser("schema", help="print the schema reference")
     schema_cmd.add_argument("--json", action="store_true")
@@ -128,13 +143,20 @@ def _cmd_init(args) -> int:
     from .initdb import init_database
 
     # Start from the existing config so credential paths survive; override what
-    # the user asked for on the command line.
+    # the user asked for on the command line. Reading the resolved default when
+    # --config was omitted matters as much as reading the named file: `init`
+    # saves over it, so skipping it silently discards a working authorisation.
     base = None
-    if args.config:
-        try:
-            base = Config.load(args.config)
-        except ConfigError:
-            pass
+    try:
+        base = Config.load(Config.resolve_path(args.config))
+    except (ConfigError, OSError, ValueError):
+        pass
+    existed = base is not None
+    # With no config anywhere, the dataclass defaults are the documented
+    # locations. Substituting "" instead writes a config whose token file is
+    # Path(""), which Drive then reports as "token file . is unreadable".
+    if base is None:
+        base = Config()
 
     if args.backend == "local":
         if not args.root:
@@ -143,9 +165,9 @@ def _cmd_init(args) -> int:
         root = Path(args.root).expanduser()
         cfg = Config(
             backend="local", local_root=str(root), actor=args.actor,
-            token_path=getattr(base, "token_path", ""),
-            client_secret_path=getattr(base, "client_secret_path", ""),
-            service_account_path=getattr(base, "service_account_path", ""),
+            token_path=base.token_path,
+            client_secret_path=base.client_secret_path,
+            service_account_path=base.service_account_path,
         )
     else:
         if not args.drive_folder:
@@ -153,10 +175,13 @@ def _cmd_init(args) -> int:
             return 2
         cfg = Config(
             backend=args.backend, drive_folder_id=args.drive_folder, actor=args.actor,
-            token_path=getattr(base, "token_path", ""),
-            client_secret_path=getattr(base, "client_secret_path", ""),
-            service_account_path=getattr(base, "service_account_path", ""),
+            token_path=base.token_path,
+            client_secret_path=base.client_secret_path,
+            service_account_path=base.service_account_path,
         )
+
+    if existed:
+        _warn_reset_fields(base, cfg, args.actor)
 
     svc, created = init_database(cfg)
     wiped = ""
@@ -185,6 +210,29 @@ def _cmd_init(args) -> int:
     return 0
 
 
+def _warn_reset_fields(old: Config, new: Config, actor: str) -> None:
+    """Announce what re-running ``init`` takes away from an existing config.
+
+    The file is rewritten whole from the command line plus the credential paths, so
+    every other field falls back to its default. Two of those are worth their noise:
+    ``drive_file_ids`` is hand-authored -- nothing in the code writes it, it is the
+    documented override for colliding table names -- and the Drive setup notes tell
+    people to re-run ``init`` after a read times out mid-setup, which is precisely
+    when an override would be sitting there waiting to be dropped.
+    """
+    asked = {"backend", "token_path", "client_secret_path", "service_account_path"}
+    asked |= {"local_root"} if new.backend == "local" else {"drive_folder_id"}
+    if actor:
+        asked.add("actor")
+    before, after = old.to_dict(), new.to_dict()
+    reset = [f"{key}={before[key]!r} -> {after[key]!r}"
+             for key in before
+             if key not in asked and before[key] != after[key]]
+    if reset:
+        print("note: init rewrites the config; resetting " + ", ".join(reset),
+              file=sys.stderr)
+
+
 def _cmd_show_config(args) -> int:
     cfg = _load_config(args)
     print(json.dumps(cfg.to_dict(), indent=2))
@@ -207,8 +255,8 @@ def _cmd_auth(args) -> int:
 
     cfg = _load_config(args)
     if not cfg.is_drive:
-        print(f"note: this config uses backend={cfg.backend!r}; Drive credentials "
-              "are only needed for drive_csv / drive_sheets", file=sys.stderr)
+        print(f"note: this config uses backend={cfg.backend!r}; Drive credentials are "
+              "only needed for backend='drive'", file=sys.stderr)
     try:
         if args.check:
             info = whoami(cfg)
@@ -272,7 +320,7 @@ def _cmd_query(args) -> int:
 
     svc = Service.open(args.config)
     try:
-        result = run_sql(svc.db, args.sql, limit=args.limit)
+        result = run_sql(svc.db, args.sql, limit=args.limit, offset=args.offset)
     except QueryError as e:
         print(f"query: {e}", file=sys.stderr)
         return 1
@@ -317,6 +365,37 @@ def _cmd_occupancy(args) -> int:
             detail = (f"{r['items_held']:>4} item(s), {r['child_containers']} "
                       f"container(s) inside")
         print(f"{r['container_id']:<14} {r['kind']:<12} {r['label']:<28} {detail}")
+    return 0
+
+
+def _cmd_enrol(args) -> int:
+    if not args.from_ancestors:
+        print("enrol: --from-ancestors is the only action this command performs", file=sys.stderr)
+        return 2
+
+    svc = Service.open(args.config)
+    result = svc.backfill_enrolments(dry_run=args.dry_run)
+
+    for w in result.warnings:
+        print(f"  - {w['severity'].upper():7} {w['table']}[{w['row_id']}].{w['field']}: "
+              f"{w['message']}", file=sys.stderr)
+    if result.warnings:
+        print(f"enrol: nothing written -- {len(result.warnings)} pairing(s) that no enrolment row "
+              "or ancestor supports. Those block every write touching samples, so resolve them "
+              "first; this command will not invent the consent.", file=sys.stderr)
+        return 1
+
+    if not result.records:
+        print("enrol: nothing to do, every pairing already has its own row")
+        return 0
+
+    wrote = bool(result.touched)
+    print(f"enrol: {'wrote' if wrote else 'would write'} {len(result.records)} "
+          "enrolment row(s)")
+    for r in result.records[:40]:
+        print(f"  {r['patient_id']} -> {r['project_id']}")
+    if len(result.records) > 40:
+        print(f"  ... and {len(result.records) - 40} more")
     return 0
 
 

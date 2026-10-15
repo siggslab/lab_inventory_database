@@ -14,6 +14,7 @@ writing means an accepted write can always be undone by copying files back.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -36,8 +37,19 @@ class ServiceError(RuntimeError):
 
 
 class ValidationError(ServiceError):
-    def __init__(self, violations: list[validation.Violation]):
+    """A write that would leave the database invalid.
+
+    ``introduced`` separates the violations this call caused from the ones already
+    standing in the files. From the violation set alone the two are indistinguishable,
+    and they warrant opposite advice: one is a caller who typed something wrong, the
+    other is somebody else's data -- possibly a deliberate edit that merely looks wrong.
+    """
+
+    def __init__(self, violations: list[validation.Violation], introduced=None):
         self.violations = violations
+        keys = {validation.key(v) for v in (introduced if introduced is not None else violations)}
+        self.introduced = [v for v in violations if validation.key(v) in keys]
+        self.preexisting = [v for v in violations if validation.key(v) not in keys]
         lines = "\n".join("  - " + str(v) for v in violations)
         super().__init__(f"write refused, {len(violations)} problem(s):\n{lines}")
 
@@ -95,9 +107,133 @@ class ItemFilter:
     unlocated: bool = False
     include_deleted: bool = False
     has_position: Optional[bool] = None
+    no_project: bool = False
+    no_patient: bool = False
+    received_since: str = ""
+    received_before: str = ""
+    expires_before: str = ""
+    measured_after: str = ""
+
+
+#: Dates are ISO strings compared as text, which is why a bare year or a
+#: year-month bounds a full date correctly ("2024-11-13" >= "2024"), and why a date
+#: bounds a timestamp the same way ("2026-10-01T09:30Z" >= "2026-10-01"). A time is
+#: accepted because ``measured_on`` carries one -- pasting a reading's own stamp back
+#: as the bound is the common case -- and so is its zone marker. Anything else is a typo
+#: that would quietly answer nothing, so it is refused instead. The marker is dropped
+#: before comparing; see ``validation.strip_zone``.
+_DATE_BOUND = re.compile(
+    r"^\d{4}(-\d{2}(-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?)?)?([zZ]|[+-]\d{2}:?\d{2})?$")
+
+_SORTS = ("name", "status", "class", "received_on", "updated_at")
+
+
+def _page(rows: list, cap: Optional[int], offset: int | str) -> tuple[list, int, bool]:
+    """One page of an ordered result, and whether another page exists.
+
+    ``cap`` of ``None`` means no ceiling. ``truncated`` answers "is there more past this
+    page", not "was this page shortened" -- the two differ on the last page, where a short
+    answer would otherwise read as though the walk had stopped early. A caller that only
+    ever asks for one page learns the same thing it did before.
+    """
+    try:
+        off = int(offset or 0)
+    except (TypeError, ValueError):
+        raise ServiceError(f"offset {offset!r} is not a row count") from None
+    if off < 0:
+        raise ServiceError(f"offset must be 0 or more, got {off}")
+    if cap is not None and cap < 1:
+        raise ServiceError(f"limit must be 1 or more to cap a page, got {cap}")
+    page = rows[off:] if cap is None else rows[off:off + cap]
+    return page, off, off + len(page) < len(rows)
 
 
 _STATUS_ORDER = {"present": 0, "partially_consumed": 1, "consumed": 2}
+
+# Which column holds "what this is called" and "the free text about it" for each table a
+# model may edit prose on. They differ -- a box has a label, a project keeps its prose in
+# ``description`` -- and the caller has no reason to have memorised that, so the id picks
+# the column instead of being asked to name it.
+_NAME_COLUMN = {"items": "name", "projects": "name", "assays": "name",
+                "containers": "label", "patients": "label"}
+_NOTES_COLUMN = {"items": "notes", "containers": "notes", "patients": "notes",
+                 "assays": "notes", "projects": "description"}
+
+# Class-specific descriptive fields and the tables that hold them. ``handler`` lives on the
+# supertype, so it is legal whatever the item turns out to be.
+_DATA_FIELDS: dict[str, tuple[str, ...]] = {
+    "source_material": ("samples",),
+    "collected_on": ("samples",),
+    "received_on": ("samples",),
+    "processed_on": ("samples",),
+    "gml_id": ("samples",),
+    "storage_requirements": ("reagents", "kits", "consumables"),
+    "expires_on": ("reagents", "kits", "consumables"),
+    "price": ("reagents", "kits", "consumables"),
+    "handler": ("items",),
+}
+
+
+def _or_join(names: tuple[str, ...]) -> str:
+    """``"samples"``, ``"reagents, kits or consumables"`` -- a refusal should read as a
+    sentence, not as a tuple repr."""
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + f" or {names[-1]}"
+
+
+def _id_list(ids: list[str], cap: int = 10) -> str:
+    """The ids a refusal is blocking on, spelled out so each one can be acted on.
+    Capped -- a full box is a ``get_contents`` call away, not a paragraph."""
+    shown = ", ".join(ids[:cap])
+    return shown + (f" (+{len(ids) - cap} more)" if len(ids) > cap else "")
+
+
+def _other_projects(links: list[dict], project_id: str) -> dict[str, list[str]]:
+    """Every participant in ``project_id``, mapped to the projects they are enrolled
+    in besides it. Sorted, so exactly one alternative reads as a deduction rather than
+    an arbitrary pick; empty means this project was their only one."""
+    members = {(r.get("patient_id", "") or "").strip() for r in links
+               if (r.get("project_id", "") or "").strip() == project_id}
+    members.discard("")
+    out: dict[str, list[str]] = {who: [] for who in members}
+    for r in links:
+        who = (r.get("patient_id", "") or "").strip()
+        prj = (r.get("project_id", "") or "").strip()
+        if who in out and prj and prj != project_id and prj not in out[who]:
+            out[who].append(prj)
+    for known in out.values():
+        known.sort()
+    return out
+
+
+def _order_rows(rows: list[dict], sort: str) -> list[dict]:
+    """Order by one named column; a leading ``-`` reverses it.
+
+    Empty is today's behaviour -- name ascending, which is what every existing
+    caller sees. ``status`` orders by what the tube has been through rather than
+    alphabetically, because partially-consumed-before-present is not an ordering
+    anyone means.
+    """
+    spec = (sort or "").strip().lower()
+    if not spec:
+        return rows
+    reverse = spec.startswith("-")
+    key = spec.lstrip("-+")
+    if key not in _SORTS:
+        raise ServiceError(
+            f"sort {sort!r} is not a sortable field; use one of "
+            + ", ".join(_SORTS)
+            + ", prefixed with - for descending"
+        )
+
+    def value(row: dict):
+        if key == "status":
+            return _STATUS_ORDER.get(row.get("status", ""), 9)
+        got = row.get(key) or (row.get("sample") or {}).get(key, "")
+        return str(got).lower()
+
+    return sorted(rows, key=value, reverse=reverse)
 
 
 class Service:
@@ -181,8 +317,18 @@ class Service:
             raise NotFound(f"no item with id {item_id!r}")
         return self._merged_item(row)
 
-    def search_items(self, **kwargs) -> list[dict]:
-        return [self._lean_row(r) for r in self._matching_items(**kwargs)]
+    def search_items(self, sort: str = "", limit: int = 0, offset: int | str = 0,
+                     **kwargs) -> dict:
+        # Ordered and capped while the records are still whole -- ``received_on``
+        # lives on the extension row, which the lean pass strips away.
+        rows = _order_rows(self._matching_items(**kwargs), sort)
+        page, off, more = _page(rows, limit or None, offset)
+        return {
+            "matched": len(rows),
+            "offset": off,
+            "truncated": more,
+            "rows": [self._lean_row(r) for r in page],
+        }
 
     def _matching_items(self, **kwargs) -> list[dict]:
         """Filtered items as complete summary records.
@@ -193,10 +339,27 @@ class Service:
         """
         f = ItemFilter(**kwargs)
         db = self.db
+        for name in ("received_since", "received_before", "expires_before", "measured_after"):
+            bound = getattr(f, name)
+            if bound and not _DATE_BOUND.match(bound.strip()):
+                raise ServiceError(
+                    f"{name} {bound!r} is not a date; use YYYY-MM-DD, or a bare "
+                    "YYYY / YYYY-MM to bound a whole year or month"
+                )
         items = db.items_by_id()
         ext_index = self._extension_index()
         containers = db.containers_by_id()
         needle = f.text.lower().strip()
+        # A reading-bound filter asks "has this item been measured lately", which is
+        # a fact about the measurements table, so it is resolved once here rather
+        # than per row. live() yields once -- materialise it.
+        measured_after = validation.strip_zone(f.measured_after)
+        recently_measured = (
+            {(m.get("item_id", "") or "").strip()
+             for m in db.t("measurements").live()
+             if validation.strip_zone(m.get("measured_on", "")) >= measured_after}
+            if measured_after else None
+        )
         out: list[dict] = []
         for iid, row in items.items():
             deleted = bool((row.get("deleted_at", "") or "").strip())
@@ -223,6 +386,26 @@ class Service:
             if f.patient_id and ext.get("patient_id", "") != f.patient_id:
                 continue
             if f.project_id and ext.get("project_id", "") != f.project_id:
+                continue
+            if f.no_project and (
+                row.get("class", "") != "sample" or (ext.get("project_id", "") or "").strip()
+            ):
+                continue
+            if f.no_patient and (
+                row.get("class", "") != "sample" or (ext.get("patient_id", "") or "").strip()
+            ):
+                continue
+            # An unrecorded date is not "before" anything, so a bounded row must
+            # carry one: a tube nobody dated never shows up as received last spring.
+            received = (ext.get("received_on", "") or "").strip()
+            if f.received_since and not (received and received >= f.received_since.strip()):
+                continue
+            if f.received_before and not (received and received < f.received_before.strip()):
+                continue
+            expires = (ext.get("expires_on", "") or "").strip()
+            if f.expires_before and not (expires and expires < f.expires_before.strip()):
+                continue
+            if recently_measured is not None and iid not in recently_measured:
                 continue
             if needle:
                 hay = " ".join(
@@ -269,6 +452,11 @@ class Service:
         return item
 
     def list_containers(self, kind: str = "", parent_id: str = "") -> list[dict]:
+        """Every container with its own figures -- what ``ls --containers`` prints.
+
+        No MCP tool wraps this any more; ``search_containers`` answers the model-facing
+        question and ``get_occupancy`` the fill figures. The CLI still walks it whole.
+        """
         db = self.db
         out = []
         for row in db.t("containers").rows:
@@ -283,27 +471,70 @@ class Service:
         out.sort(key=lambda r: " / ".join(r["path"]))
         return out
 
-    def container_tree(self, root_id: str = "") -> list[dict]:
+    def search_containers(
+        self, query: str, kind: str = "", within_id: str = "", limit: int = 20,
+        offset: int | str = 0
+    ) -> dict:
+        """Containers whose id or label matches ``query``, as places rather than numbers.
+
+        Matching runs against the containers table, so a box holding nothing still comes
+        back -- the difference between "empty" and "no such box". Rows carry identity and
+        position only: how full something is belongs to ``get_occupancy``, what is inside
+        it to ``get_contents``. Nothing is nested, so no row repeats its ancestry beyond
+        ``path``, and there are no child counts to reconcile with a later call.
+
+        ``within_id`` takes the whole subtree, not just the direct children, because
+        "what is in freezer 7" means the boxes three levels down too. The named container
+        is excluded from its own results -- it is the scope, not a find.
+
+        Rows come back in tree order and stop at ``limit``, reporting ``matched`` and
+        ``truncated`` rather than leaving a suspiciously round row count to interpret.
+        There is no blank query; every id starts with ``ctr_``, which serves as match-all.
+        """
+        needle = query.strip().lower()
+        if not needle:
+            raise ServiceError(
+                "query is required; match on a container id or part of a label"
+            )
+        level = kind.strip()
+        if level and level not in schema.CONTAINER_KINDS:
+            raise ServiceError(
+                f"kind {level!r} is not a container kind "
+                f"({' '.join(schema.CONTAINER_KINDS)})"
+            )
+        try:
+            cap = max(1, int(limit))
+        except (TypeError, ValueError):
+            cap = 20
         db = self.db
-        children: dict[str, list[str]] = {}
         by_id = db.containers_by_id()
-        for cid, row in by_id.items():
-            parent = (row.get("parent_id", "") or "").strip()
-            children.setdefault(parent, []).append(cid)
-        for kids in children.values():
-            kids.sort(key=lambda c: by_id[c].get("label", "").lower())
-
-        def build(cid: str) -> dict:
-            node = self._container_summary(cid, by_id[cid])
-            node["children"] = [build(c) for c in children.get(cid, [])]
-            return node
-
-        roots = children.get("", [])
-        if root_id:
-            if root_id not in by_id:
-                raise NotFound(f"no container with id {root_id!r}")
-            return [build(root_id)]
-        return [build(c) for c in roots]
+        scope: set[str] | None = None
+        if within_id.strip():
+            wid = within_id.strip()
+            if wid not in by_id:
+                raise NotFound(f"no container with id {wid!r}")
+            scope = self._container_subtree(wid) - {wid}
+        found = [
+            cid for cid, row in by_id.items()
+            if (not level or row.get("kind", "") == level)
+            and (scope is None or cid in scope)
+            and (needle in cid.lower()
+                 or needle in (row.get("label", "") or "").lower())
+        ]
+        rows = [
+            {
+                "container_id": cid,
+                "kind": by_id[cid].get("kind", ""),
+                "label": by_id[cid].get("label", ""),
+                "parent_id": (by_id[cid].get("parent_id", "") or "").strip(),
+                "path": " / ".join(db.container_path(cid)),
+            }
+            for cid in sorted(
+                found, key=lambda c: " / ".join(db.container_path(c)).lower()
+            )
+        ]
+        page, off, more = _page(rows, cap, offset)
+        return {"matched": len(rows), "offset": off, "truncated": more, "rows": page}
 
     def get_occupancy(self, container_id: str, kind: str = "") -> dict:
         """How full one container is, reported at the granularity ``kind`` names.
@@ -500,22 +731,45 @@ class Service:
         out.sort(key=lambda r: r["path"])
         return out
 
-    def contents(self, container_id: str, recursive: bool = False) -> dict:
-        """What is stored in a container: lean rows, plus room at the top."""
+    def get_contents(self, container_id: str) -> dict:
+        """What sits directly in this container -- tubes and boxes alike -- plus room at the top.
+
+        One layer only, deliberately. A freezer reports its shelves and no tubes, because
+        that is where its contents actually live; walking the whole subtree here would
+        duplicate what ``search_containers`` with ``within_id`` is for, and would bury the
+        box's own free space under everything below it.
+
+        Nested containers are rows in their own right and are counted, because a rack
+        holding two boxes holds two things -- a caller reading only ``items`` would report
+        that freezer as empty. They carry identity alone: how full each one is belongs to
+        ``get_occupancy``, which states its figures in one tier's unit rather than mixing
+        wells with box positions. Consumed items hold no slot, so they have no location and
+        appear nowhere.
+        """
         db = self.db
         by_id = db.containers_by_id()
         if container_id not in by_id:
             raise NotFound(f"no container with id {container_id!r}")
-        targets = self._container_subtree(container_id) if recursive else {container_id}
         row = by_id[container_id]
         occupants = [
             i for i in db.items_by_id().values()
-            if (i.get("location_id", "") or "").strip() in targets
+            if (i.get("location_id", "") or "").strip() == container_id
             and not (i.get("deleted_at", "") or "").strip()
         ]
+        kids = sorted(
+            (by_id[c] for c in db.child_containers(container_id)),
+            key=lambda k: k.get("label", "").lower(),
+        )
         cap = db.capacity_of(container_id)
-        kids = db.child_containers(container_id)
-        here = len(db.occupants(container_id))
+        items = [
+            self._contents_row(i)
+            for i in sorted(
+                occupants,
+                key=lambda i: (
+                    i.get("position", ""), i.get("name", "").lower(), i["item_id"]
+                ),
+            )
+        ]
         return {
             "container": {
                 "container_id": container_id,
@@ -524,44 +778,40 @@ class Service:
                 "path": " / ".join(db.container_path(container_id)),
                 "geometry": self._geometry(row),
                 "capacity": cap,
-                "occupied_here": here,
-                # Nested containers take slots too, so free is not capacity minus the
-                # items listed below -- otherwise a bench reports room that isn't there.
-                "child_containers": len(kids),
-                "free": (cap - here - len(kids)) if cap is not None else None,
+                # Slots taken is len(items) + len(containers); free stays because it says
+                # whether that is measurable at all -- null is not the same as full.
+                "free": (cap - len(items) - len(kids)) if cap is not None else None,
             },
-            "recursive": recursive,
-            "count": len(occupants),
-            "items": [
-                self._contents_row(i, db, container_id, recursive)
-                for i in sorted(
-                    occupants,
-                    key=lambda i: (
-                        i.get("position", ""), i.get("name", "").lower(), i["item_id"]
-                    ),
-                )
-            ],
+            "count": len(items) + len(kids),
+            "items": items,
+            "containers": [self._contents_container(k) for k in kids],
         }
 
-    def _contents_row(self, item: dict, db, top: str, recursive: bool) -> dict:
-        row = {
+    @staticmethod
+    def _contents_row(item: dict) -> dict:
+        return {
             "item_id": item["item_id"],
             "class": item.get("class", ""),
             "name": item.get("name", ""),
             "status": item.get("status", ""),
             "position": (item.get("position", "") or "").strip(),
         }
-        if recursive:
-            loc = (item.get("location_id", "") or "").strip()
-            row["in"] = (
-                " / ".join(db.container_path(loc)) if loc != top else ""
-            )
-        return row
+
+    @staticmethod
+    def _contents_container(row: dict) -> dict:
+        return {
+            "container_id": row["container_id"].strip(),
+            "kind": row.get("kind", ""),
+            "label": row.get("label", ""),
+        }
 
     def count_items(self, **kwargs) -> int:
-        return len(self.search_items(**kwargs))
+        # Counts the untrimmed records: a count should not pay for building the
+        # lean rows nobody asked for, nor read them back out of a capped page.
+        return len(self._matching_items(**kwargs))
 
-    def search_patients(self, query: str, project_id: str = "", limit: int = 20) -> dict:
+    def search_patients(self, query: str, project_id: str = "", limit: int = 20,
+                        offset: int | str = 0) -> dict:
         """Participants whose id or label matches ``query``, each with sample counts.
 
         Matching runs against the participants table, not the samples, so an enrolled
@@ -612,15 +862,200 @@ class Service:
              **counts.get(p["patient_id"], empty)}
             for p in sorted(matched, key=by_volume)
         ]
+        page, off, more = _page(people, cap, offset)
         return {
             "matched": len(people),
-            "truncated": len(people) > cap,
+            "offset": off,
+            "truncated": more,
             "unassigned": unassigned["total"],
-            "rows": people[:cap],
+            "rows": page,
         }
 
-    def rollup_by_project(self, **kwargs) -> list[dict]:
-        return self._rollup("project", **kwargs)
+    def get_patient(self, patient_id: str) -> dict:
+        """One participant in full: the record as enrolled, plus what we hold for them.
+
+        ``search_patients`` answers who; this answers what is known about them. Every
+        field comes back -- sex, date of birth, affected status, gene, variant,
+        protocol, consent date -- because those are written once at enrolment and asked
+        about long afterwards, and nothing else on the surface carries them. The
+        enrolments are listed rather than counted: "what is this person in" is the
+        question, and a count cannot answer it. Sample figures arrive both whole and
+        split by project, since the split is why anyone asks.
+        """
+        pid = (patient_id or "").strip()
+        if not pid:
+            raise ServiceError("patient_id is required; see search_patients")
+        row = next(
+            (p for p in self.db.t("patients").live()
+             if (p.get("patient_id", "") or "").strip() == pid),
+            None,
+        )
+        if row is None:
+            raise NotFound(f"no participant with id {pid!r}; see search_patients")
+
+        projects = {
+            (p.get("project_id", "") or "").strip(): p
+            for p in self.db.t("projects").live()
+        }
+        empty = {"total": 0, "present": 0, "partially_consumed": 0, "consumed": 0}
+        by_project: dict[str, dict] = {}
+        whole = dict(empty)
+        for it in self._matching_items(item_class="sample", patient_id=pid):
+            bucket = by_project.setdefault(
+                (it.get("sample") or {}).get("project_id", ""), dict(empty)
+            )
+            bucket["total"] += 1
+            whole["total"] += 1
+            if it.get("status", "") in bucket:
+                bucket[it["status"]] += 1
+                whole[it["status"]] += 1
+
+        enrolments = []
+        for edge in self.db.t("patient_projects").live():
+            if (edge.get("patient_id", "") or "").strip() != pid:
+                continue
+            key = (edge.get("project_id", "") or "").strip()
+            project = projects.get(key)
+            enrolments.append({
+                "project_id": key,
+                "name": project.get("name", "") if project else "",
+                "status": project.get("status", "") if project else "",
+                "samples": by_project.get(key, dict(empty)),
+            })
+        enrolments.sort(key=lambda e: e["name"].lower())
+        # Held for a project the person is not enrolled in is worth seeing, and so is
+        # material with no project at all -- both are why the enrolment rows do not sum
+        # to ``samples``, which would otherwise read as arithmetic that went wrong.
+        orphaned = {k: v for k, v in by_project.items()
+                    if k not in {e["project_id"] for e in enrolments}}
+        return {
+            "patient_id": pid,
+            "label": row.get("label", ""),
+            "sex": row.get("sex", ""),
+            "dob": row.get("dob", ""),
+            "affected_status": row.get("affected_status", ""),
+            "gene": row.get("gene", ""),
+            "variant": row.get("variant", ""),
+            "protocol": row.get("protocol", ""),
+            "consented_on": row.get("consented_on", ""),
+            "notes": row.get("notes", ""),
+            "updated_by": row.get("updated_by", ""),
+            "updated_at": row.get("updated_at", ""),
+            "samples": whole,
+            "enrolments": enrolments,
+            "unenrolled_samples": orphaned,
+        }
+
+    def list_assays(self) -> dict:
+        """The measurement registry: what may be recorded, and in which unit.
+
+        Small and finite, so it comes back whole. ``readings`` counts every row filed
+        against the assay, corrections included, which is how an assay that was defined
+        and never used tells you so -- and it is the count that decides whether
+        ``delete_assay`` can land. Rows keep ``assay_id`` because that is what
+        ``edit_name``, ``edit_notes`` and ``delete_assay`` take; a reading names its assay
+        by ``code``, which is what ``record_measurement`` accepts.
+        """
+        used: dict[str, int] = {}
+        for m in self.db.t("measurements").live():
+            key = (m.get("assay_id", "") or "").strip()
+            used[key] = used.get(key, 0) + 1
+        rows = [
+            {
+                "assay_id": (a.get("assay_id", "") or "").strip(),
+                "code": a.get("code", ""),
+                "name": a.get("name", ""),
+                "quantity": a.get("quantity", ""),
+                "canonical_unit": a.get("canonical_unit", ""),
+                "result_type": a.get("result_type", ""),
+                "method": a.get("method", ""),
+                "readings": used.get((a.get("assay_id", "") or "").strip(), 0),
+            }
+            for a in self.db.t("assays").live()
+        ]
+        rows.sort(key=lambda r: r["code"].lower())
+        return {"count": len(rows), "rows": rows}
+
+    def search_projects(self, query: str, limit: int = 20, offset: int | str = 0) -> dict:
+        """Projects whose id or name matches ``query``, each with what sits under it.
+
+        Matching runs against the projects table rather than the samples, so a project
+        with nothing attached still comes back with zeroed figures -- the difference
+        between "not started yet" and "no such project".
+
+        Counts are **direct**: a subproject's material belongs to the subproject's row
+        and never to its parent's, because summing rows across a match-all query would
+        otherwise count the same tube twice. ``subprojects`` says how many sit below, so
+        a caller can see there is more without absorbing it.
+
+        Two things live under a project: enrolled participants (``patient_projects``)
+        and samples (``samples.project_id``). Reagents, kits and consumables carry no
+        project column at all, so they are absent by construction instead of pooled into
+        a pseudo-project -- the old rollup filed every supply under a fake bucket named
+        "(none)", which made a project total mean two different things at once. Samples
+        with no project recorded surface as ``unassigned_samples`` beside the rows.
+        """
+        needle = query.strip().lower()
+        if not needle:
+            raise ServiceError(
+                "query is required; match on a project id or part of a name"
+            )
+        try:
+            cap = max(1, int(limit))
+        except (TypeError, ValueError):
+            cap = 20
+
+        db = self.db
+        projects = list(db.t("projects").live())  # live() is single-pass; two walks need a list
+        matched = [
+            p for p in projects
+            if needle in p.get("project_id", "").lower()
+            or needle in p.get("name", "").lower()
+        ]
+
+        children: dict[str, int] = {}
+        for p in projects:
+            parent = (p.get("parent_project_id", "") or "").strip()
+            if parent:
+                children[parent] = children.get(parent, 0) + 1
+
+        living = {p["patient_id"] for p in db.t("patients").live()}
+        enrolled: dict[str, set] = {}
+        for link in db.t("patient_projects").live():
+            pid = (link.get("project_id", "") or "").strip()
+            who = (link.get("patient_id", "") or "").strip()
+            if pid and who in living:
+                enrolled.setdefault(pid, set()).add(who)
+
+        empty = {"total": 0, "present": 0, "partially_consumed": 0, "consumed": 0}
+        samples: dict[str, dict] = {}
+        unassigned = dict(empty)
+        for it in self._matching_items(item_class="sample"):
+            pid = (it.get("sample") or {}).get("project_id", "")
+            bucket = samples.setdefault(pid, dict(empty)) if pid else unassigned
+            bucket["total"] += 1
+            if it.get("status", "") in bucket:
+                bucket[it["status"]] += 1
+
+        def by_volume(p: dict) -> tuple:
+            return (-samples.get(p["project_id"], empty)["total"],
+                    p.get("name", "").lower())
+
+        rows = [
+            {"key": p["project_id"], "label": p.get("name", ""),
+             "subprojects": children.get(p["project_id"], 0),
+             "participants": len(enrolled.get(p["project_id"], ())),
+             "samples": dict(samples.get(p["project_id"], empty))}
+            for p in sorted(matched, key=by_volume)
+        ]
+        page, off, more = _page(rows, cap, offset)
+        return {
+            "matched": len(rows),
+            "offset": off,
+            "truncated": more,
+            "unassigned_samples": unassigned["total"],
+            "rows": page,
+        }
 
     def get_measurements(self, **kwargs) -> list[dict]:
         """Filtered readings, trimmed for a context window. See ``_measurement_rows``."""
@@ -638,11 +1073,13 @@ class Service:
         The untrimmed sibling of ``get_measurements``: same filters, every column.
         Exports read it so the model-facing rows can stay as thin as they want.
 
-        Two independent axes of extra rows, both off by default.
-        ``include_superseded`` adds readings a correction invalidated; those are
-        never candidates for "the latest", so they arrive on top of whatever the
-        other flags chose. ``include_historical`` adds valid readings that a newer
-        one has overtaken -- the whole series instead of its endpoint.
+        Two ways to ask for more rows than the current belief, both off by default.
+        ``include_historical`` adds every earlier reading for the assay, including
+        the ones a later reading took over from -- the whole series instead of its
+        endpoint. ``include_superseded`` adds just those taken-over readings, on top
+        of the newest-per-assay trim. Since a recording retires the reading it
+        overtakes, both flags now reach the same rows; they differ only in whether
+        the trim still applies.
 
         An empty ``item_id`` means every item, which is what the exports iterate.
         The MCP tool requires one; this layer does not.
@@ -661,10 +1098,16 @@ class Service:
         }
         rows = []
         retired = []
-        for r in db.t("measurements").rows:
+        # Where each reading sits in the table, so a series comes back in the order it
+        # was entered -- the same clock that decides which one is current. Sorting by
+        # ``measured_on`` instead split a same-minute re-measurement apart, because
+        # readings are stamped to the minute.
+        position: dict[str, int] = {}
+        for index, r in enumerate(db.t("measurements").rows):
             mid = (r.get("measurement_id", "") or "").strip()
             if not mid:
                 continue
+            position[mid] = index
             if item_id and (r.get("item_id", "") or "").strip() != item_id:
                 continue
             assay_id = (r.get("assay_id", "") or "").strip()
@@ -707,16 +1150,22 @@ class Service:
             for r in rows:
                 latest[(r["item_id"], r["assay"])] = r
             rows = list(latest.values())
-        if include_superseded:
+        # A recording retires the reading it overtakes, so the series lives in
+        # ``retired`` now rather than in the untrimmed rows: asking for history has
+        # to fetch those, or "the whole series" would mean one row per assay.
+        if include_superseded or include_historical:
             rows.extend(retired)
-        rows.sort(key=lambda x: (x["item_id"], x["assay"], x["measured_on"]))
+        rows.sort(key=lambda x: (x["item_id"], x["assay"], position[x["measurement_id"]]))
         return rows
 
     # A reading answers what was measured, when, and whether it is still the
     # belief. The assay code already keys the registry, so quantity is one lookup
     # away; the row echoes no item_id because a reading query names its item.
-    # Canonical conversion stays in the exports, where the arithmetic belongs --
-    # value+unit here is the number as observed, which is what prose quotes back.
+    # ``value``+``unit`` is the number as observed, which is what prose quotes back,
+    # and ``canonical`` is the same observation expressed in the assay's unit -- the
+    # arithmetic is done for exports anyway, and a comparison the surface keeps
+    # private is a comparison the model cannot make. Null for a qualitative reading,
+    # which has no magnitude to convert.
     @staticmethod
     def _tool_reading(m: dict) -> dict:
         return {
@@ -726,6 +1175,7 @@ class Service:
             "measured_on": m["measured_on"],
             "value": m["value_num"] if m["value_num"] is not None else m["value_text"],
             "unit": m["unit"],
+            "canonical": m["canonical"],
             "handler": m["handler"],
             "instrument": m["instrument"],
             "supersedes": m["supersedes"],
@@ -811,7 +1261,7 @@ class Service:
             raise NotFound(f"no item with id {item_id!r}")
         return walk(item_id, direction, depth, {item_id})
 
-    def run_query(self, sql: str, limit: int = 500) -> dict:
+    def run_query(self, sql: str, limit: int = 500, offset: int = 0) -> dict:
         """Guarded read-only SQL over an in-memory mirror of the tables.
 
         Exists because ad-hoc questions ('how many PBMC samples per project
@@ -821,7 +1271,7 @@ class Service:
         """
         from .query import run_sql
 
-        return run_sql(self.db, sql, limit=limit)
+        return run_sql(self.db, sql, limit=limit, offset=offset)
 
     # -- mutations -----------------------------------------------------------
 
@@ -915,8 +1365,12 @@ class Service:
         quantity_unit: str = "",
         quantity_measured_on: str = "",
     ) -> CommitResult:
-        if item_class not in ("reagent", "kit", "consumable"):
-            raise ServiceError(f"{item_class!r} is not a supply class")
+        if item_class not in schema.SUPPLY_CLASSES:
+            raise ServiceError(
+                f"{item_class!r} is not a supply class; supply classes are "
+                f"{', '.join(schema.SUPPLY_CLASSES)} -- a tube of material is a sample, "
+                "made by create_sample"
+            )
         table = schema.CLASS_EXTENSION_TABLE[item_class]
         iid = ids.new_id(schema.ITEM_CLASS_PREFIX[item_class])
         item = self._new_item_row(
@@ -936,9 +1390,7 @@ class Service:
         if initial_quantity != "":
             mid = ids.new_id("msm")
             assay_id = self._assay_id_for_code(quantity_assay) if quantity_assay else ""
-            measured_on = _s(quantity_measured_on)
-            if not measured_on:
-                measured_on = validation.format_datetime(validation.now_utc_minute())
+            measured_on = self._timestamp(quantity_measured_on)
             measurements.append(
                 {
                     "measurement_id": mid,
@@ -959,59 +1411,185 @@ class Service:
         result.records = [self.get_item(iid)]
         return result
 
-    def move_item(
-        self,
-        item_id: str,
-        location_id: Optional[str] = None,
-        position: Optional[str] = None,
-        clear_location: bool = False,
-    ) -> CommitResult:
-        db = self.db
-        row = self._require_item(item_id)
-        updated = dict(row)
-        if clear_location:
-            updated["location_id"] = ""
-            updated["position"] = ""
-        else:
-            moved_container = (
-                location_id is not None
-                and location_id.strip() != (row.get("location_id", "") or "").strip()
-            )
-            if location_id is not None:
-                updated["location_id"] = location_id.strip()
-            if position is not None:
-                updated["position"] = position.strip()
-            elif moved_container:
-                # A well label belongs to a particular grid. Carrying "A1" into a
-                # box with different geometry -- or one whose row labels skip I --
-                # would assert something nobody confirmed, so it becomes unknown.
-                updated["position"] = ""
-        if updated.get("status", "") == "consumed" and updated.get("location_id", ""):
-            raise Conflict(
-                f"{item_id} is consumed and holds no slot; set it back to present first"
-            )
-        updated.update(self._audit())
-        result = self._apply("move_item", [("items", [], [updated])])
-        result.records = [self.get_item(item_id)]
-        return result
+    def move(
+        self, object_id: str, target_id: str, position: Optional[str] = None
+    ) -> dict:
+        """Put one thing inside a container: a tube in a box, a box in a rack.
 
-    def set_status(self, item_id: str, status: str, allow_backwards: bool = False) -> CommitResult:
+        Items and containers move the same way because a slot is a slot -- ``occupied``
+        counts a box squatting on a bench exactly like a tube in a well, so moving either
+        takes one and the target's capacity decides whether it fits. That is checked here
+        rather than left to the post-write validator, because "no space in Rack 3 (6/6)"
+        is the answer the caller needs and the table-wide rule can only say that some row
+        now disagrees with its capacity.
+
+        A container cannot be moved into its own descendant, which would detach the
+        subtree below it from every path above. Checked before the write, not discovered
+        afterwards as a cycle no walk can escape.
+
+        ``position`` is convenience data, as everywhere else: most entries are filed at
+        box level and nothing is computed from wells. It applies to items only -- a
+        container sits in a slot, not a well. Omitting it keeps a well label when the
+        container is unchanged and drops it when it isn't, because "A1" means different
+        tubes in boxes of different geometry, and carrying it over would assert something
+        nobody confirmed. Pass ``""`` to forget a label while staying put.
+
+        Returns where the thing came from and where it went, and nothing else: the record
+        itself is ``get_item``'s job, and a move that succeeded has changed no other field.
+        """
+        db = self.db
+        kind, row = self._require_movable(object_id)
+        oid = (row.get("item_id") or row.get("container_id") or "").strip()
+
+        containers = db.containers_by_id()
+        target = (target_id or "").strip()
+        if not target:
+            raise ServiceError("target_id is required; name the container to move it into")
+        if target not in containers:
+            raise NotFound(
+                f"no container with id {target!r}; target_id names the destination "
+                f"container (see search_containers)"
+            )
+
+        if kind == "container":
+            if position is not None:
+                raise ServiceError(
+                    "position is for items; a container takes a slot in its parent, not a well"
+                )
+            if target == oid:
+                raise Conflict("cannot move a container into itself")
+            if target in self._container_subtree(oid):
+                raise Conflict(
+                    f"cannot move {row.get('label', oid)!r} into "
+                    f"{containers[target].get('label', target)!r}: that is already inside it"
+                )
+            old_loc = (row.get("parent_id", "") or "").strip()
+            old_pos = ""
+            updated = dict(row)
+            updated["parent_id"] = target
+            table = "containers"
+        else:
+            old_loc = (row.get("location_id", "") or "").strip()
+            old_pos = (row.get("position", "") or "").strip()
+            new_pos = (old_pos if position is None and target == old_loc
+                       else (position or "").strip())
+            if row.get("status", "") == "consumed":
+                raise Conflict(
+                    f"{oid} is consumed and holds no slot; set it back to present with a "
+                    "location_id first"
+                )
+            updated = dict(row)
+            updated["location_id"] = target
+            updated["position"] = new_pos
+            table = "items"
+
+        self._require_space(target, oid)
+
+        updated.update(self._audit())
+        self._apply("move", [(table, [], [updated])])
+
+        out = {
+            "id": oid,
+            "kind": row.get("class", "") if kind == "item" else "container",
+            "from": self._place(old_loc, old_pos),
+            "to": self._place(target, updated.get("position", "")),
+        }
+        return out
+
+    def _require_space(self, container_id: str, moving_id: str) -> None:
+        """Refuse a placement the target's geometry cannot hold.
+
+        Checked by whoever is placing, not left to the post-write validator: "no space in
+        Rack 3 (6/6)" is the answer the caller needs, while the table-wide rule can only
+        say that some row now disagrees with its capacity.
+        """
+        cap = self.db.capacity_of(container_id)
+        if cap is None:
+            return
+        held = [i for i in self.db.occupants(container_id) if i.get("item_id", "") != moving_id]
+        kids = [c for c in self.db.child_containers(container_id) if c != moving_id]
+        used = len(held) + len(kids)
+        if used + 1 > cap:
+            label = self.db.containers_by_id().get(container_id, {}).get("label", container_id)
+            raise Conflict(f"no space in {label!r}: {used}/{cap} slots taken and this needs one")
+
+    def _place(self, container_id: str, position: str) -> dict:
+        """Where something sits, as far as anyone recorded it."""
+        if not container_id:
+            return {"container_id": "", "label": "", "position": ""}
+        row = self.db.containers_by_id().get(container_id, {})
+        return {
+            "container_id": container_id,
+            "label": row.get("label", ""),
+            "position": position,
+        }
+
+    def _require_movable(self, object_id: str) -> tuple[str, dict]:
+        """``("item" | "container", row)`` for anything that occupies a slot."""
+        oid = (object_id or "").strip()
+        if not oid:
+            raise ServiceError("id is required; pass an item id or a container id")
+        item = self.db.items_by_id().get(oid)
+        if item is not None:
+            if (item.get("deleted_at", "") or "").strip():
+                raise NotFound(f"{oid} was deleted; it has no live row to move")
+            return "item", item
+        container = self.db.containers_by_id().get(oid)
+        if container is not None:
+            return "container", container
+        raise NotFound(
+            f"nothing with id {oid!r}; pass an item id (smp_, rgt_, kit_, csm_) "
+            f"or a container id (ctr_)"
+        )
+
+    def set_status(self, item_id: str, status: str, location_id: str = "") -> CommitResult:
+        """Mark an item present, partially_consumed, or consumed, in either direction.
+
+        Consuming releases the slot, because a tube that is used up cannot keep a well
+        occupied -- and the well label goes with it, since it describes a place the tube
+        is no longer in. Nothing remembers it. Coming back out of ``consumed`` therefore
+        needs a container named, which is also how a mis-recorded consumption gets undone
+        in one write instead of leaving the item floating unlocated between two calls.
+        """
         row = self._require_item(item_id)
-        current = row.get("status", "")
+        if (row.get("deleted_at", "") or "").strip():
+            raise Conflict(
+                f"{item_id} was deleted and remains only as a tombstone for provenance; "
+                "its status is not changed"
+            )
         if status not in schema.ITEM_STATUSES:
             raise ServiceError(f"status must be one of {schema.ITEM_STATUSES}")
-        if _STATUS_ORDER.get(status, 0) < _STATUS_ORDER.get(current, 0) and not allow_backwards:
-            raise Conflict(
-                f"{item_id} is already {current!r}; moving back to {status!r} needs "
-                "allow_backwards=true (it usually means something was mis-recorded)"
-            )
         updated = dict(row)
         updated["status"] = status
+        located = (row.get("location_id", "") or "").strip()
+        target = (location_id or "").strip()
         if status == "consumed":
+            if target:
+                raise ServiceError(
+                    "a consumed item holds no slot, so it takes no location_id; leave it "
+                    "out, or mark the item present to put it somewhere"
+                )
             # A consumed item cannot occupy a slot. Dropping the position here is
             # deliberate: keeping it would claim a well that is physically free.
             updated["location_id"] = ""
             updated["position"] = ""
+        elif target:
+            if target not in self.db.containers_by_id():
+                raise NotFound(
+                    f"no container with id {target!r}; location_id names the container to "
+                    f"file it in (see search_containers)"
+                )
+            self._require_space(target, item_id.strip())
+            updated["location_id"] = target
+            if target != located:
+                updated["position"] = ""
+        else:
+            if not located:
+                raise ServiceError(
+                    f"{item_id} holds no slot, and {status!r} needs one: pass location_id "
+                    "(see search_containers). Consuming drops the location and nothing "
+                    "remembers it."
+                )
         updated.update(self._audit())
         result = self._apply("set_status", [("items", [], [updated])])
         result.records = [self.get_item(item_id)]
@@ -1022,9 +1600,9 @@ class Service:
         item_id: str,
         assay: str = "",
         measured_on: str = "",
-        value: str = "",
+        value_num: str = "",
         unit: str = "",
-        text: str = "",
+        value_text: str = "",
         handler: str = "",
         instrument: str = "",
         supersedes: str = "",
@@ -1034,17 +1612,18 @@ class Service:
         self._require_item(item_id)
         assay_row = self._resolve_assay(assay, assay_id)
         assay_label = assay_row.get("code", "") or assay_row.get("name", "")
-        if not value and not text:
-            raise ServiceError("pass either value= (numeric assays) or text= (textual assays)")
+        if not value_num and not value_text:
+            raise ServiceError(
+                "pass either value_num= (numeric assays) or value_text= (qualitative assays)")
         if assay_row.get("result_type") == "numeric":
-            if not value:
+            if not value_num:
                 raise ServiceError(
-                    f"assay {assay_label!r} is numeric; pass value= not text="
+                    f"assay {assay_label!r} is numeric; pass value_num= not value_text="
                 )
             try:
-                float(value)
+                float(value_num)
             except ValueError:
-                raise ServiceError(f"value {value!r} is not a number") from None
+                raise ServiceError(f"value_num {value_num!r} is not a number") from None
             quantity = assay_row.get("quantity", "other")
             if not unit:
                 if quantity in units.UNITLESS:
@@ -1057,21 +1636,32 @@ class Service:
                         f"{assay_row.get('canonical_unit', '?')})"
                     )
             try:
-                units.to_canonical(quantity, float(value), unit)
+                units.to_canonical(quantity, float(value_num), unit)
             except units.UnitError as e:
                 raise ServiceError(str(e)) from None
         else:
-            if not text:
-                raise ServiceError(f"assay {assay_label!r} is textual; pass text= not value=")
-        when = measured_on or validation.format_datetime(validation.now_utc_minute())
+            if not value_text:
+                raise ServiceError(
+                    f"assay {assay_label!r} is qualitative; pass value_text= not value_num=")
+        when = self._timestamp(measured_on)
         mid = ids.new_id("msm")
+        # A second reading for the same item and assay takes over from whichever one
+        # stood, unless the caller named a different row to retire. Without this the
+        # sheet holds two values for one question and only entry order separates
+        # them -- true everywhere else in this codebase, but invisible to whoever
+        # opens the spreadsheet. Retiring is a note on the new row, not an edit of
+        # the old one, so readings stay append-only.
+        took_over = ""
+        if not supersedes.strip():
+            took_over = self._current_reading_id(item_id.strip(), assay_row["assay_id"])
+            supersedes = took_over
         row = {
             "measurement_id": mid,
             "item_id": item_id.strip(),
             "assay_id": assay_row["assay_id"],
             "measured_on": when,
-            "value_num": _s(value),
-            "value_text": text,
+            "value_num": _s(value_num),
+            "value_text": value_text,
             "unit": unit,
             "handler": handler or self.actor(),
             "instrument": instrument,
@@ -1086,7 +1676,36 @@ class Service:
             m for m in self.get_measurements(item_id=item_id.strip(), include_superseded=True)
             if m["measurement_id"] == mid
         ]
+        if took_over:
+            result.warnings.append(validation.Violation(
+                table="measurements", row_id=mid, field="supersedes",
+                code="auto_superseded", severity="warning",
+                message=f"{took_over} was the current {assay_label} reading for "
+                        f"{item_id.strip()}; this one retires it. Pass supersedes= to "
+                        "retire a different reading instead.",
+            ).as_dict())
         return result
+
+    def _current_reading_id(self, item_id: str, assay_id: str) -> str:
+        """What a new reading of this item and assay would take over from.
+
+        The last row written that nobody has retired, which is how ``get_measurements``
+        and the ``latest_measurements`` view both define the current value. Empty when
+        there is nothing to retire -- an item's first reading for an assay must not
+        claim to replace something.
+        """
+        t = self.db.t("measurements")
+        retired = {(r.get("supersedes", "") or "").strip() for r in t.rows} - {""}
+        current = ""
+        for r in t.rows:
+            if (r.get("item_id", "") or "").strip() != item_id:
+                continue
+            if (r.get("assay_id", "") or "").strip() != assay_id:
+                continue
+            mid = (r.get("measurement_id", "") or "").strip()
+            if mid and mid not in retired:
+                current = mid
+        return current
 
     def correct_measurement(self, measurement_id: str, **changes) -> CommitResult:
         """Measurements are immutable; a correction appends and invalidates."""
@@ -1106,9 +1725,9 @@ class Service:
             # code round-trip would break if an assay were ever renamed.
             "assay_id": (old.get("assay_id", "") or "").strip(),
             "measured_on": changes.pop("measured_on", old.get("measured_on", "")),
-            "value": changes.pop("value", old.get("value_num", "")),
+            "value_num": changes.pop("value_num", old.get("value_num", "")),
             "unit": changes.pop("unit", old.get("unit", "")),
-            "text": changes.pop("text", old.get("value_text", "")),
+            "value_text": changes.pop("value_text", old.get("value_text", "")),
             "handler": changes.pop("handler", self.actor()),
             "instrument": changes.pop("instrument", old.get("instrument", "")),
             "notes": changes.pop("notes", old.get("notes", "")),
@@ -1146,7 +1765,8 @@ class Service:
         result.records = [row]
         return result
 
-    def update_fields(self, table: str, record_id: str, **changes) -> CommitResult:
+    def update_fields(self, table: str, record_id: str, *,
+                      operation: str = "update_fields", **changes) -> CommitResult:
         """Edit mutable descriptive fields. Ids, foreign keys and status have
         their own operations because they carry structural consequences."""
         spec = schema.get_table(table)
@@ -1167,19 +1787,100 @@ class Service:
             updated[k] = _s(v)
         if t.spec.field("updated_by"):
             updated.update(self._audit())
-        result = self._apply("update_fields", [(table, [], [updated])])
+        result = self._apply(operation, [(table, [], [updated])])
         result.records = [dict(updated)]
         return result
 
-    def create_patient(self, label: str, **kw) -> CommitResult:
+    def _descriptive_target(self, oid: str, columns: dict[str, str]) -> tuple[str, dict, str]:
+        """``(table, row, column)`` for whichever table holds this id.
+
+        The id decides the table by itself: they are minted with a per-table prefix and are
+        looked up by primary key, which is already how ``move`` dispatches. So a caller that
+        knows what it is holding never has to declare it, and cannot declare it wrongly.
+        """
+        if not oid:
+            raise ServiceError(
+                "id is required; pass one from search_items, search_containers, "
+                "search_patients or search_projects")
+        for table, column in columns.items():
+            row = self.db.t(table).get(oid)
+            if row is not None:
+                if (row.get("deleted_at") or "").strip():
+                    raise Conflict(
+                        f"{oid} was deleted and remains only as a tombstone for provenance; "
+                        "its text is not edited")
+                return table, row, column
+        raise NotFound(
+            f"nothing editable with id {oid!r}; expected an item (smp_, rgt_, kit_, csm_), "
+            "a container (ctr_), a participant (pat_), a project (prj_) or an assay (asy_)")
+
+    def item_class(self, item_id: str) -> str:
+        """``sample`` | ``reagent`` | ``kit`` | ``consumable`` for an item id."""
+        return self._require_item(item_id).get("class", "").strip()
+
+    def edit_name(self, object_id: str, name: str) -> CommitResult:
+        """Rename whatever the id points at -- an item's name, a box's label, a project's name."""
+        oid = (object_id or "").strip()
+        if not str(name).strip():
+            raise ServiceError(
+                "name cannot be blank: someone has to read this entry aloud, and there is no "
+                "unnamed state to move it to")
+        table, _, column = self._descriptive_target(oid, _NAME_COLUMN)
+        return self.update_fields(table, oid, operation="edit_name", **{column: name})
+
+    def edit_notes(self, object_id: str, notes: str) -> CommitResult:
+        """Replace the free text on an entry; a project keeps its prose in ``description``."""
+        oid = (object_id or "").strip()
+        table, _, column = self._descriptive_target(oid, _NOTES_COLUMN)
+        return self.update_fields(table, oid, operation="edit_notes", **{column: notes})
+
+    def edit_data(self, object_id: str, field: str, value: str) -> CommitResult:
+        """Set one class-specific field on an item, resolved from what the item actually is.
+
+        The class comes off the ``items`` row rather than from the caller, so asking a
+        sample for a reagent's price is refused by fact, with both sides named, instead of
+        being accepted on the caller's say-so and landing in the wrong table.
+        """
+        oid = (object_id or "").strip()
+        row = self._require_item(oid)
+        if (row.get("deleted_at") or "").strip():
+            raise Conflict(
+                f"{oid} was deleted and remains only as a tombstone for provenance; its "
+                "fields are not edited")
+        allowed = _DATA_FIELDS.get((field or "").strip())
+        if allowed is None:
+            raise ServiceError(
+                f"no editable field {field!r}; editable are {', '.join(sorted(_DATA_FIELDS))}")
+        cls = row.get("class", "").strip()
+        table = "items" if field == "handler" else schema.CLASS_EXTENSION_TABLE.get(cls, "")
+        if table not in allowed:
+            raise ServiceError(
+                f"{field} belongs to {_or_join(allowed)}, and {oid} is a "
+                f"{cls or 'record of unknown class'}")
+        return self.update_fields(table, oid, operation="edit_data", **{field: value})
+
+    def create_patient(self, label: str, project_id: str, **kw) -> CommitResult:
+        """Register a participant and enrol them in their first project.
+
+        Both rows commit together. A participant with no enrolment is a participant
+        whose material cannot be filed anywhere, so there is no useful state where
+        the patient exists and the pairing does not.
+        """
+        if not str(project_id).strip():
+            raise ServiceError(
+                "project_id is required -- a participant is registered inside a project; "
+                "see search_projects"
+            )
         pid = ids.new_id("pat")
         row = {"patient_id": pid, "label": label, **self._audit()}
         for k, v in kw.items():
             if schema.PATIENTS.field(k) is None:
                 raise ServiceError(f"patients has no field {k!r}")
             row[k] = _s(v)
-        result = self._apply("create_patient", [("patients", [row], [])])
-        result.records = [row]
+        link = {"link_id": ids.new_id("ppl"), "patient_id": pid, "project_id": _s(project_id)}
+        result = self._apply("create_patient",
+                             [("patients", [row], []), ("patient_projects", [link], [])])
+        result.records = [row, link]
         return result
 
     def create_project(self, name: str, status: str = "active", parent_project_id: str = "", **kw) -> CommitResult:
@@ -1200,16 +1901,164 @@ class Service:
         return result
 
     def assign_patient_project(self, patient_id: str, project_id: str) -> CommitResult:
+        """Add a further project to an existing participant; their first one comes
+        from ``create_patient``."""
         for r in self.db.t("patient_projects").rows:
             if (
                 r.get("patient_id", "").strip() == patient_id
                 and r.get("project_id", "").strip() == project_id
             ):
-                raise Conflict("that patient is already registered under that project")
+                raise Conflict("that participant is already enrolled in that project")
         lid = ids.new_id("ppl")
         row = {"link_id": lid, "patient_id": patient_id, "project_id": project_id}
         result = self._apply("assign_patient_project", [("patient_projects", [row], [])])
         result.records = [row]
+        return result
+
+    def unassign_patient_project(self, patient_id: str, project_id: str,
+                                 move_to: str = "") -> CommitResult:
+        """Withdraw a participant from a project, settling their material in the same
+        commit.
+
+        Deleting the row on its own would leave every sample naming the pair illegal,
+        and because that rule is reported whatever row caused it, the database would
+        then refuse every write touching samples -- including the writes needed to fix
+        it. So the tubes are dealt with here rather than afterwards, and there is no
+        moment where the caller is handed a list they cannot act on.
+
+        Without ``move_to`` their ``project_id`` is cleared. A tube with a participant
+        and no project is legal and findable (``search_items(no_project=True)``), so
+        withdrawing someone never requires deciding their destination first. With
+        ``move_to`` the tubes are re-pointed at another project the participant is
+        enrolled in. Tombstoned tubes are left untouched: a deletion is history, not a
+        live claim about routing, and the rule ignores them too.
+        """
+        who, pr = str(patient_id).strip(), str(project_id).strip()
+        if not who:
+            raise ServiceError("patient_id is required; see search_patients")
+        if not pr:
+            raise ServiceError("project_id is required; see search_projects")
+        target = str(move_to).strip()
+        if target and target == pr:
+            raise ServiceError("move_to cannot be the project being withdrawn")
+
+        links = self.db.t("patient_projects").rows
+        link = next((r for r in links
+                     if (r.get("patient_id", "") or "").strip() == who
+                     and (r.get("project_id", "") or "").strip() == pr), None)
+        if link is None:
+            raise NotFound(f"{who!r} is not enrolled in {pr!r}; see get_patient")
+        if target:
+            known = {r["project_id"].strip() for r in self.db.t("projects").rows
+                     if r.get("project_id", "").strip()}
+            if target not in known:
+                raise NotFound(f"no project with id {target!r}; see search_projects")
+            held = {(r.get("project_id", "") or "").strip() for r in links
+                    if (r.get("patient_id", "") or "").strip() == who}
+            if target not in held:
+                raise ServiceError(
+                    f"{who!r} is not enrolled in {target!r}; enrol them there first, or "
+                    "omit move_to and leave those tubes without a project"
+                )
+
+        buried = {iid for iid, row in self.db.items_by_id().items()
+                  if (row.get("deleted_at", "") or "").strip()}
+        touched_ids: list[str] = []
+        updates: list[dict] = []
+        for r in self.db.t("samples").rows:
+            iid = (r.get("item_id", "") or "").strip()
+            if iid in buried:
+                continue
+            if ((r.get("patient_id", "") or "").strip() == who
+                    and (r.get("project_id", "") or "").strip() == pr):
+                touched_ids.append(iid)
+                updates.append(dict(r, project_id=target))
+
+        remaining = [r for r in links
+                     if not ((r.get("patient_id", "") or "").strip() == who
+                             and (r.get("project_id", "") or "").strip() == pr)]
+        changes: list[tuple] = ([("samples", [], updates)] if updates else []) + [
+            ("patient_projects", [], [], remaining)]
+        result = self._apply("unassign_patient_project", changes)
+
+        still_in = sorted({(r.get("project_id", "") or "").strip() for r in remaining
+                           if (r.get("patient_id", "") or "").strip() == who})
+        result.records = [{
+            "removed": {"patient_id": who, "project_id": pr, "link_id": link["link_id"]},
+            "samples_repointed": len(touched_ids) if target else 0,
+            "samples_unpinned": 0 if target else len(touched_ids),
+            "sample_ids": touched_ids[:50],
+            "sample_ids_truncated": len(touched_ids) > 50,
+            "participant_still_in": still_in,
+            "was_their_last_project": not still_in,
+        }]
+        return result
+
+    def backfill_enrolments(self, dry_run: bool = False) -> CommitResult:
+        """Write out an explicit enrolment row for every sample whose pairing is
+        covered only by an ancestor project.
+
+        This is the migration for databases built while enrolment inherited down the
+        tree. Those tubes are legal under the old rule and illegal under exact
+        matching, and since any write touching samples reports the whole rule's
+        violations, they would block unrelated work until someone added each row by
+        hand.
+
+        Only pairs that hold material get a row -- an unused branch stays unenrolled,
+        because nobody asserted it. A pair with no coverage anywhere is reported in
+        ``warnings`` rather than invented: nothing in the database authorises it, so
+        the honest answer is that a human has to decide.
+
+        Nothing is written while such a pair exists. They block every write touching
+        samples, this one included, so a partial migration would leave the database
+        exactly as stuck as it was and look like it had helped. An empty
+        ``touched_tables`` means nothing changed.
+        """
+        projects = {r["project_id"].strip(): r for r in self.db.t("projects").rows
+                    if r.get("project_id", "").strip()}
+
+        def ancestors(project_id: str) -> set[str]:
+            chain, seen, cur = set(), set(), project_id
+            while cur and cur in projects and cur not in seen:
+                seen.add(cur)
+                chain.add(cur)
+                cur = (projects[cur].get("parent_project_id", "") or "").strip() or None
+            return chain
+
+        held: dict[str, set[str]] = {}
+        for r in self.db.t("patient_projects").rows:
+            who, pr = (r.get("patient_id", "") or "").strip(), (r.get("project_id", "") or "").strip()
+            if who and pr:
+                held.setdefault(who, set()).add(pr)
+
+        new_rows: list[dict] = []
+        pending: set[tuple[str, str]] = set()
+        unfixable: list[validation.Violation] = []
+        for r in self.db.t("samples").rows:
+            iid = (r.get("item_id", "") or "").strip()
+            who, pr = (r.get("patient_id", "") or "").strip(), (r.get("project_id", "") or "").strip()
+            if not (who and pr):
+                continue
+            if pr in held.get(who, set()) or (who, pr) in pending:
+                continue
+            if held.get(who, set()) & ancestors(pr):
+                pending.add((who, pr))
+                new_rows.append({"link_id": ids.new_id("ppl"), "patient_id": who, "project_id": pr})
+            else:
+                unfixable.append(validation.Violation(
+                    "samples", iid, "project_id", "unbackfillable_pair", "error",
+                    f"sample names patient {who!r} and project {pr!r}, which no enrolment row "
+                    "or ancestor of one supports -- this command will not invent that consent"))
+
+        if dry_run or not new_rows or unfixable:
+            return CommitResult(operation="backfill_enrolments", touched=(),
+                                snapshot=Snapshot(path=None, tables=()),
+                                records=new_rows,
+                                warnings=[v.as_dict() for v in unfixable])
+
+        result = self._apply("backfill_enrolments", [("patient_projects", new_rows, [])])
+        result.records = new_rows
+        result.warnings = [v.as_dict() for v in unfixable]
         return result
 
     def create_assay(
@@ -1242,15 +2091,18 @@ class Service:
 
     # -- destructive ---------------------------------------------------------
 
-    def delete_item(self, item_id: str, force: bool = False) -> CommitResult:
+    def delete_item(self, item_id: str) -> CommitResult:
+        """Retire an item, whatever state it was in.
+
+        Nothing here depends on status. Throwing away a tube that still holds material
+        happens, and no later step would catch it, so there is nothing to gate it
+        behind. What retirement does change is the row's claim on a place: the location
+        and well go with it, because a retired tube occupies no well. Measurements and
+        derivation links keep pointing at the row -- provenance outlives the tube.
+        """
         row = self._require_item(item_id)
         if (row.get("deleted_at", "") or "").strip():
             raise Conflict(f"{item_id} is already deleted")
-        if row.get("status", "") != "consumed" and not force:
-            raise Conflict(
-                f"{item_id} is {row.get('status', '?')!r}, not consumed. Discarding a "
-                "tube that still holds material needs force=true."
-            )
         updated = dict(row)
         updated["deleted_at"] = validation.format_datetime(validation.now_utc_minute())
         updated["location_id"] = ""
@@ -1261,31 +2113,218 @@ class Service:
         return result
 
     def delete_container(self, container_id: str) -> CommitResult:
+        """Remove a storage location once nothing lives inside it.
+
+        Live residents block the delete and are listed by id, because the caller has to
+        act on each one -- move or retire it, then retry. A retired item still naming
+        this place is a different case: its row can be neither moved nor edited, so
+        refusing over it would make the container permanently undeletable. Its stale
+        location is cleared in this same commit instead, which is also what stops the
+        reference surviving as a dangling foreign key that refuses every later write.
+        """
+        cid = str(container_id).strip()
         db = self.db
         by_id = db.containers_by_id()
-        if container_id not in by_id:
-            raise NotFound(f"no container with id {container_id!r}")
-        occupants = db.occupants(container_id)
-        if occupants:
+        if cid not in by_id:
+            raise NotFound(f"no container with id {cid!r}; see search_containers")
+        occupants = db.occupants(cid)
+        children = db.child_containers(cid)
+        if occupants or children:
+            blocks = []
+            if occupants:
+                blocks.append(
+                    f"it holds {len(occupants)} item(s): {_id_list([r['item_id'] for r in occupants])}"
+                )
+            if children:
+                blocks.append(f"it has {len(children)} container(s) inside it: {_id_list(children)}")
             raise Conflict(
-                f"{by_id[container_id].get('label', container_id)!r} still holds "
-                f"{len(occupants)} item(s); move them out first"
+                f"{cid} cannot be deleted yet: {' and '.join(blocks)}"
+                " -- empty it, then delete it again"
             )
-        children = [
-            c for c in by_id.values() if (c.get("parent_id", "") or "").strip() == container_id
+        changes: list[tuple] = []
+        stale = [
+            dict(r, location_id="", position="")
+            for r in db.t("items").rows
+            if (r.get("location_id", "") or "").strip() == cid
         ]
-        if children:
-            raise Conflict(f"{container_id} still has {len(children)} child container(s)")
+        if stale:
+            changes.append(("items", [], stale))
         t = db.t("containers")
-        rows = [r for r in t.rows if (r.get("container_id", "") or "").strip() != container_id]
-        result = self._apply("delete_container", [("containers", [], [], rows)])
-        result.records = [{"deleted_container": container_id}]
+        changes.append(
+            ("containers", [], [], [r for r in t.rows
+                                    if (r.get("container_id", "") or "").strip() != cid])
+        )
+        result = self._apply("delete_container", changes)
+        result.records = [{"deleted_container": cid, "references_cleared": len(stale)}]
+        return result
+
+    def delete_patient(self, patient_id: str) -> CommitResult:
+        """Remove a participant and everything that existed only to describe them.
+
+        A sample does not need a participant, so their tubes stay and simply stop
+        naming them -- including the retired ones, because a foreign key is checked
+        whether or not the item is alive, and a leftover reference here would refuse
+        every later write that touches samples. Their enrolments go with them: with no
+        participant there is no pairing left to mean anything. Nothing can block this,
+        which is why there is nothing to force.
+        """
+        pid = str(patient_id).strip()
+        db = self.db
+        patients = db.t("patients").rows
+        if not any((r.get("patient_id", "") or "").strip() == pid for r in patients):
+            raise NotFound(f"no participant with id {pid!r}; see search_patients")
+
+        links = db.t("patient_projects").rows
+        removed_links = [r for r in links if (r.get("patient_id", "") or "").strip() == pid]
+        samples = db.t("samples").rows
+        updates = [
+            dict(r, patient_id="")
+            for r in samples
+            if (r.get("patient_id", "") or "").strip() == pid
+        ]
+        changes: list[tuple] = [
+            ("patients", [], [], [r for r in patients
+                                  if (r.get("patient_id", "") or "").strip() != pid]),
+            ("patient_projects", [], [], [r for r in links
+                                          if (r.get("patient_id", "") or "").strip() != pid]),
+        ]
+        if updates:
+            changes.append(("samples", [], updates))
+        result = self._apply("delete_patient", changes)
+        result.records = [{
+            "patient_id": pid,
+            "enrolments_removed": len(removed_links),
+            "samples_unlinked": len(updates),
+        }]
+        return result
+
+    def delete_project(self, project_id: str) -> CommitResult:
+        """Remove a project, taking each participant's material to where it can go.
+
+        Samples do not need a project, so a tube whose participant has nowhere else to
+        go loses the label rather than blocking the delete. Participants are the other
+        way round: the enrolment is what makes a sample's project legal in the first
+        place, so withdrawing someone from their only project would leave their tubes
+        illegal. That is why this delete lands only when every participant here has
+        exactly one unambiguous alternative. Anything else is refused with the ids that
+        have to be dealt with first -- subprojects still hanging off this one, someone
+        with no other project, or someone with two or more where the destination is a
+        decision rather than a deduction.
+        """
+        pid = str(project_id).strip()
+        db = self.db
+        projects = db.t("projects").rows
+        if not any((r.get("project_id", "") or "").strip() == pid for r in projects):
+            raise NotFound(f"no project with id {pid!r}; see search_projects")
+
+        children = sorted(
+            (r.get("project_id", "") or "").strip() for r in projects
+            if (r.get("parent_project_id", "") or "").strip() == pid
+        )
+        links = db.t("patient_projects").rows
+        others = _other_projects(links, pid)
+        enrolled = sorted(others)
+        stranded = [w for w in enrolled if not others[w]]
+        ambiguous = {w: others[w] for w in enrolled if len(others[w]) > 1}
+
+        blocks = []
+        if children:
+            blocks.append(
+                f"it has {len(children)} subproject(s): {_id_list(children)} -- nesting "
+                "inherits nothing, so those stand alone and go first"
+            )
+        if stranded:
+            blocks.append(
+                f"it is the only project for {len(stranded)} participant(s): "
+                f"{_id_list(stranded)} -- enrol them in another project first"
+            )
+        if ambiguous:
+            detail = "; ".join(f"{w} -> {', '.join(v[:4])}" for w, v in list(ambiguous.items())[:5])
+            more = f" (+{len(ambiguous) - 5} more)" if len(ambiguous) > 5 else ""
+            blocks.append(
+                f"it leaves {len(ambiguous)} participant(s) choosing between projects, so the "
+                f"destination is a decision rather than a deduction: {detail}{more} -- "
+                "withdraw them down to one other project, or re-point their samples first"
+            )
+        if blocks:
+            raise Conflict(f"{pid} cannot be deleted yet: {'; '.join(blocks)}")
+
+        moves = {w: others[w][0] for w in enrolled if others[w]}
+        updates: list[dict] = []
+        repointed = 0
+        for r in db.t("samples").rows:
+            if (r.get("project_id", "") or "").strip() != pid:
+                continue
+            dest = moves.get((r.get("patient_id", "") or "").strip(), "")
+            updates.append(dict(r, project_id=dest))
+            repointed += 1 if dest else 0
+        removed_links = [r for r in links if (r.get("project_id", "") or "").strip() == pid]
+        changes: list[tuple] = [
+            ("projects", [], [], [r for r in projects
+                                  if (r.get("project_id", "") or "").strip() != pid]),
+            ("patient_projects", [], [], [r for r in links
+                                          if (r.get("project_id", "") or "").strip() != pid]),
+        ]
+        if updates:
+            changes.append(("samples", [], updates))
+        result = self._apply("delete_project", changes)
+        result.records = [{
+            "project_id": pid,
+            "enrolments_removed": len(removed_links),
+            "samples_repointed": repointed,
+            "samples_cleared": len(updates) - repointed,
+            "moved_to": [
+                {"patient_id": w, "project_id": dest}
+                for w, dest in sorted(moves.items())
+                if any((r.get("patient_id", "") or "").strip() == w for r in updates)
+            ],
+        }]
+        return result
+
+    def delete_assay(self, assay_id: str) -> CommitResult:
+        """Remove a kind of measurement, once nothing has been measured with it.
+
+        A reading names its assay and readings only compare inside one, so deleting the
+        definition would leave every number filed against it meaningless -- and dangling,
+        which refuses every later write on its own account. Nothing here can discard a
+        reading, so an assay with history stays put and keeps explaining what its numbers
+        were; this delete lands on the ones defined and never used, which is what a
+        mis-typed definition turns out to be.
+        """
+        aid = str(assay_id).strip()
+        db = self.db
+        assays = db.t("assays").rows
+        if not any((r.get("assay_id", "") or "").strip() == aid for r in assays):
+            raise NotFound(f"no assay with id {aid!r}; see list_assays")
+
+        readings = sorted(
+            (r.get("measurement_id", "") or "").strip() for r in db.t("measurements").rows
+            if (r.get("assay_id", "") or "").strip() == aid
+        )
+        if readings:
+            raise Conflict(
+                f"{aid} cannot be deleted yet: it has {len(readings)} reading(s) "
+                f"recorded against it: {_id_list(readings)} -- readings are immutable, "
+                "so the assay stays and keeps describing what they mean"
+            )
+
+        result = self._apply(
+            "delete_assay",
+            [("assays", [], [], [r for r in assays
+                                 if (r.get("assay_id", "") or "").strip() != aid])])
+        result.records = [{"deleted_assay": aid}]
         return result
 
     def merge_items(self, keep_id: str, discard_id: str, reason: str = "") -> CommitResult:
         """Re-point everything referencing ``discard_id``, then tombstone it."""
         keep = self._require_item(keep_id)
         discard = self._require_item(discard_id)
+        # Compared on the resolved ids, so ' smp_x ' and 'smp_x' collide too: the
+        # tombstone below lands on discard, which would silently delete the survivor.
+        if keep.get("item_id", "") == discard.get("item_id", ""):
+            raise ServiceError(
+                "keep_id and discard_id name the same item; nothing to merge"
+            )
         if keep.get("class", "") != discard.get("class", ""):
             raise Conflict("cannot merge a " + keep.get("class", "?") + " into a " + discard.get("class", "?"))
 
@@ -1299,6 +2338,15 @@ class Service:
             if not (merged_keep.get(f, "") or "").strip() and (discard.get(f, "") or "").strip():
                 merged_keep[f] = discard[f]
                 changed_keep = True
+        # Notes are the one field where both rows usually hold something worth keeping,
+        # so they join instead of competing -- keep's first, then discard's. The
+        # tombstone below still carries the discarded text on its own row, which is how
+        # the joined pair stays separable.
+        keep_notes = (merged_keep.get("notes", "") or "").strip()
+        discard_notes = (discard.get("notes", "") or "").strip()
+        if discard_notes and discard_notes not in keep_notes:
+            merged_keep["notes"] = f"{keep_notes}\n{discard_notes}".strip()
+            changed_keep = True
         merged_keep.update(self._audit())
         if changed_keep:
             changes.append(("items", [], [merged_keep]))
@@ -1401,6 +2449,23 @@ class Service:
             "updated_by": self.actor(),
             "updated_at": validation.format_datetime(validation.now_utc_minute()),
         }
+
+    @staticmethod
+    def _timestamp(value: str = "") -> str:
+        """Put a caller's timestamp into the spelling this database stores.
+
+        Blank means now. Anything else is parsed, so a zone written out as ``Z`` or
+        ``+10:00`` lands as the same minute in UTC rather than as a second spelling of
+        the column -- and a bad one is refused here, naming the value, instead of
+        arriving later as a write refused for a row the caller never mentioned.
+        """
+        value = (value or "").strip()
+        if not value:
+            return validation.format_datetime(validation.now_utc_minute())
+        dt, problem = validation.parse_datetime(value)
+        if problem:
+            raise ServiceError(problem)
+        return validation.format_datetime(dt)
 
     def _new_item_row(self, iid, cls, name, status, location_id, position, handler, notes) -> dict:
         return {
@@ -1523,8 +2588,11 @@ class Service:
     @staticmethod
     def _brief_reading(m: dict) -> dict:
         """Latest readings inline are a glance; history and correction ids are
-        ``get_measurements``, which keeps the columns dropped here."""
-        return {k: m[k] for k in ("assay", "measured_on", "value", "unit")}
+        ``get_measurements``, which keeps the columns dropped here.
+
+        The canonical figure stays even here because the glance is exactly where two
+        tubes get compared, and they are not always quoted in the same unit."""
+        return {k: m[k] for k in ("assay", "measured_on", "value", "unit", "canonical")}
 
     def _labels_for(self, ext: dict) -> dict[str, str]:
         out = {}
@@ -1562,30 +2630,6 @@ class Service:
         """Well grid as ``rows x cols``; empty for furniture, whose slots are ``capacity``."""
         r, c = (row.get("rows", "") or "").strip(), (row.get("cols", "") or "").strip()
         return f"{r}x{c}" if r and c else ""
-
-    def _rollup(self, axis: str, **kwargs) -> list[dict]:
-        """Group matching items by a flat link and count them per status.
-
-        Only one axis uses this now. ``patient`` moved to ``search_patients``, which
-        enumerates people rather than items, and there is no container axis because
-        storage is a tree -- grouping by an item's direct container counts boxes and
-        never their freezer. ``get_occupancy`` walks that hierarchy; this does not.
-        """
-        items = self._matching_items(**kwargs)
-        key_field = {"project": "project_id"}[axis]
-        label_field = "project_name"
-        buckets: dict[str, dict] = {}
-        for it in items:
-            sub = it.get("sample") or {}
-            key = sub.get(key_field, "") or "(none)"
-            label = sub.get(label_field, "") or key
-            b = buckets.setdefault(key, {"key": key, "label": label, "total": 0,
-                                         "present": 0, "partially_consumed": 0, "consumed": 0})
-            b["total"] += 1
-            st = it.get("status", "")
-            if st in b:
-                b[st] += 1
-        return sorted(buckets.values(), key=lambda b: -b["total"])
 
     # -- the commit funnel ---------------------------------------------------
 
@@ -1634,7 +2678,10 @@ class Service:
         scope_violations = validation.validate_scope(candidate, touched)
         bad = validation.errors(scope_violations)
         if bad:
-            raise ValidationError(bad)
+            # Only on the failure path: compare against what is already stored so the
+            # caller can be told which of these their own write caused.
+            standing = {validation.key(v) for v in validation.errors(validation.validate(self.db))}
+            raise ValidationError(bad, [v for v in bad if validation.key(v) not in standing])
 
         snapshot = self._snapshot(touched, operation)
         new_revisions: dict[str, str] = {}
