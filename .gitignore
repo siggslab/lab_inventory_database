@@ -30,3 +30,8 @@ drive-download-*.zip
 
 # per-machine config: credential paths and which folder is yours
 .devdb.config.json
+
+# Developer log — decisions, open threads, live-run findings, and the names of lab
+# folders. Written for whoever maintains this next, so it stays on the working
+# machine rather than in the repository. What users need is README.md and docs/.
+STATUS.md
