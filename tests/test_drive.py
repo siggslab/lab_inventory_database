@@ -16,12 +16,20 @@ from __future__ import annotations
 
 import pytest
 
+from inventory_mcp import schema
 from inventory_mcp.config import Config
-from inventory_mcp.store.base import RevisionConflict, StoreError, compute_revision
+from inventory_mcp.initdb import init_database
+from inventory_mcp.store.base import (
+    ForeignTableError,
+    RevisionConflict,
+    StoreError,
+    compute_revision,
+)
 from inventory_mcp.store.drive import (
     DriveSheetsStore,
     _column_letter,
     _from_sheet,
+    verify_folder,
 )
 
 #: What a table is under this backend: one Google spreadsheet each, not a file
@@ -83,10 +91,12 @@ class FakeDrive:
         self.next_id += 1
         return f"fid{self.next_id}"
 
-    def add(self, name, content=b"", mime="text/csv", sheet=None, parent="FOLDERID"):
+    def add(self, name, content=b"", mime="text/csv", sheet=None, parent="FOLDERID",
+            properties=None):
         fid = self.new_id()
         self.by_id[fid] = {"id": fid, "name": name, "mimeType": mime,
-                           "content": content, "sheet": sheet, "parent": parent}
+                           "content": content, "sheet": sheet, "parent": parent,
+                           "properties": properties or {}}
         return fid
 
     def only(self) -> dict:
@@ -118,7 +128,11 @@ class _Files:
         self.d.calls.append(("files.list", kw))
         parent = q.split("'")[1]
         return self._guard(lambda: {"files": [
-            {k: v for k, v in f.items() if k in ("id", "name", "mimeType")}
+            # `properties` matters: it carries the title marker this app stamps on
+            # files it created, which is how init tells its own empty spreadsheet
+            # from somebody else's converted upload.
+            {k: v for k, v in f.items()
+             if k in ("id", "name", "mimeType", "properties") and v}
             for f in self.d.by_id.values() if f["parent"] == parent
         ]})
 
@@ -135,6 +149,10 @@ class _Files:
                 "mimeType": mime,
                 "content": data,
                 "parent": (body.get("parents") or ["root"])[0],
+                # Whatever custom file properties were asked for, kept: the sheets
+                # backend stamps a title marker here and init later reads it back to
+                # tell its own files from a stranger's.
+                "properties": dict(body.get("properties") or {}),
                 "sheet": None,
             }
             if mime == SHEET:
@@ -142,6 +160,23 @@ class _Files:
                 entry["content"] = b""
             self.d.by_id[fid] = entry
             return {"id": fid}
+
+        return self._guard(run)
+
+    def get(self, fileId, fields="", **kw):
+        """Read one object's metadata, which is how a folder gets verified."""
+        self.d.calls.append(("files.get", {"fileId": fileId, "fields": fields}))
+        entry = self.d.by_id.get(fileId)
+
+        def run():
+            if entry is None:
+                raise HttpErr(404, "itemNotFound")
+            meta = {k: entry[k] for k in ("id", "name", "mimeType") if k in entry}
+            # Absent unless a test sets it: Drive omits capabilities it will not
+            # promise, and the code under test must treat that as unknown, not False.
+            if "canEdit" in entry:
+                meta["capabilities"] = {"canEdit": entry["canEdit"]}
+            return meta
 
         return self._guard(run)
 
@@ -545,3 +580,120 @@ class TestFolderResolution:
                      drive_folder_id="https://drive.google.com/drive/folders/"
                                       "1AbCdEfGhIjKlMnOpQrStUvWxYz")
         assert cfg.drive_folder_id == "1AbCdEfGhIjKlMnOpQrStUvWxYz"
+
+
+class TestVerifyFolder:
+    """Asking Drive what the named folder actually is, before anything is written.
+
+    Listing cannot answer this: an id that names nothing lists empty, which is the
+    same response a brand-new folder gives. So ``init`` would go ahead and fail on
+    its first create, with an error naming neither the flag nor the folder.
+    """
+
+    FOLDER = "application/vnd.google-apps.folder"
+
+    @pytest.fixture
+    def api(self, drive, monkeypatch):
+        from inventory_mcp.store import drive as drive_module
+
+        monkeypatch.setattr(drive_module, "drive_service", lambda config, **kw: drive)
+        return drive
+
+    def _check(self, fid):
+        return verify_folder(Config(backend="drive", drive_folder_id=fid))
+
+    def test_the_folder_answers_with_its_name(self, api):
+        fid = api.add("Lab inventory", mime=self.FOLDER, parent="root")
+        meta = self._check(fid)
+        assert meta["name"] == "Lab inventory", "the name is how you catch the wrong folder"
+        asked = api.calls[-1][1]["fields"]
+        assert "canEdit" in asked, "without it the read-only check below silently never fires"
+
+    def test_an_id_that_names_nothing_says_so(self, api):
+        api.add("Lab inventory", mime=self.FOLDER, parent="root")
+        with pytest.raises(StoreError, match="no such Drive folder"):
+            self._check("fid999")
+
+    def test_a_spreadsheet_is_not_a_folder(self, api):
+        fid = api.add("items", mime=SHEET, sheet=FakeSheet(), parent="root")
+        with pytest.raises(StoreError, match="is a spreadsheet, not a folder"):
+            self._check(fid)
+
+    def test_a_folder_this_account_cannot_write_is_refused_early(self, api):
+        fid = api.add("Shared read-only", mime=self.FOLDER, parent="root")
+        api.by_id[fid]["canEdit"] = False
+        with pytest.raises(StoreError, match="read-only"):
+            self._check(fid)
+
+    def test_capabilities_drive_will_not_promise_are_not_read_as_read_only(self, api):
+        """A missing key means unknown. Treating it as False would refuse every
+        shared drive, which is exactly the deployment this backend exists for."""
+        fid = api.add("Team drive root", mime=self.FOLDER, parent="root")
+        assert "capabilities" not in api.by_id[fid]
+        assert self._check(fid)["id"] == fid
+
+    def test_a_folder_that_won_t_show_itself_names_the_fix(self, api):
+        fid = api.add("Elsewhere", mime=self.FOLDER, parent="root")
+        api.always_fail = [HttpErr(403, "insufficient")]
+        with pytest.raises(StoreError, match="shared with that account"):
+            self._check(fid)
+
+
+class TestAdoption:
+    """``init`` refusing to take over a spreadsheet that merely wears a table's name.
+
+    The dangerous case is the quiet one. A CSV converted on upload arrives as one
+    Google spreadsheet with a single default tab -- so reading it yields no header at
+    all, which looks exactly like an empty table of ours. ``init`` found nothing to
+    object to, and the first ordinary commit renamed that default tab and wrote over
+    the contents. Nothing here contacts Google; the fake models the shapes involved.
+    """
+
+    def _init(self, cfg, drive):
+        return init_database(cfg, store=sheets_store(cfg, drive))
+
+    def test_a_converted_upload_wearing_our_name_is_refused(self, config, drive):
+        drive.add("items", mime=SHEET, sheet=FakeSheet(), parent="FOLDERID")
+        with pytest.raises(ForeignTableError, match="does not carry the title marker"):
+            self._init(config, drive)
+        assert len(drive.by_id) == 1, "refusing must not leave a half-built database"
+
+    def test_somebody_else_s_header_in_our_tab_is_refused_with_evidence(self, config, drive):
+        stranger = FakeSheet()
+        stranger.tabs = {"items": [["order", "patient"], ["47", "P-9"]]}
+        drive.add("items", mime=SHEET, sheet=stranger, parent="FOLDERID")
+        with pytest.raises(ForeignTableError, match=r"\['order', 'patient'\]"):
+            self._init(config, drive)
+
+    def test_our_own_empty_spreadsheet_is_adopted(self, config, drive):
+        """The state immediately after creation, which re-running init must survive."""
+        drive.add("items", mime=SHEET, sheet=FakeSheet(), parent="FOLDERID",
+                  properties={"title": "items"})
+        _, created = self._init(config, drive)
+        assert "items" not in created
+        assert len(created) == len(schema.TABLES) - 1
+
+    def test_an_existing_database_reinitialises_without_losing_rows(self, config, drive):
+        """Attaching from a second machine is the normal case, not an edge one."""
+        self._init(config, drive)
+        store = sheets_store(config, drive)
+        spec = schema.get_table("items")
+        store.write_table("items", spec.column_names,
+                          [{"item_id": "ITM_1", "name": "freezer rack"}], None)
+
+        _, created = self._init(config, drive)
+        assert created == [], "nothing should be created over a complete database"
+        again = sheets_store(config, drive)
+        rows = again.read_table("items").rows
+        assert [r["item_id"] for r in rows] == ["ITM_1"]
+
+    def test_a_pre_v3_header_attaches_rather_than_being_refused(self, config, drive):
+        """Overlap, not equality: live folders predate column renames, and refusing
+        them would lock out the second machine attaching to the first one's work."""
+        spec = schema.get_table("containers")
+        old = [c if c != "capacity" else "capacity_override" for c in spec.column_names]
+        drifted = FakeSheet()
+        drifted.tabs = {"containers": [old]}
+        drive.add("containers", mime=SHEET, sheet=drifted, parent="FOLDERID")
+        _, created = self._init(config, drive)
+        assert "containers" not in created, "adopted as ours despite the older spelling"

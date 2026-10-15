@@ -13,11 +13,11 @@ import os
 import sys
 from pathlib import Path
 
-from . import SCHEMA_VERSION, __version__
+from . import SCHEMA_VERSION, __version__, schema
 from .auth import AuthError
-from .config import BACKENDS, Config, ConfigError
+from .config import BACKENDS, Config, ConfigError, parse_drive_folder
 from .service import Service, ServiceError
-from .store.base import StoreError
+from .store.base import ForeignTableError, StoreError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -25,7 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     # The flags only exist on `init`, so reading them plainly raises AttributeError
     # for every other subcommand -- including `serve`, which is the product.
-    assert not (getattr(args, "seed", False) or getattr(args, "reset", False)), "Seed and reset are destructive flags that must first be manually enabled in the code"
+    assert not (getattr(args, "seed", False) or getattr(args, "reset_db", False)), "Seed and reset-db are destructive flags that must first be manually enabled in the code"
     try:
         return args.func(args)
     except ConfigError as e:
@@ -55,11 +55,20 @@ def _build_parser() -> argparse.ArgumentParser:
     init.add_argument("--root", help="directory for tables/ exports/ backups/")
     init.add_argument("--drive-folder", help="Drive folder id or URL")
     init.add_argument("--seed", action="store_true", help="fill with development fixture data")
-    init.add_argument("--reset", action="store_true",
+    init.add_argument("--reset-db", action="store_true",
                       help="discard all existing rows first (for re-seeding a test "
                            "database after an interrupted run; on Drive, version "
                            "history is the only undo)")
+    init.add_argument("--reset-config", action="store_true",
+                      help="write the config from this command line and the defaults, "
+                           "discarding hand-edited values in the existing one (the "
+                           "tables themselves are untouched)")
     init.add_argument("--actor", default="", help="identity recorded in updated_by")
+    init.add_argument("--manual", action="store_true",
+                      help="with a Drive backend and no authorisation yet, print the "
+                           "consent URL instead of opening a browser")
+    init.add_argument("--port", type=int, default=8080,
+                      help="loopback port for that consent redirect (default 8080)")
     init.set_defaults(func=_cmd_init)
 
     show = sub.add_parser("show-config", help="print resolved configuration")
@@ -158,34 +167,61 @@ def _cmd_init(args) -> int:
     if base is None:
         base = Config()
 
+    # Merge into the existing config rather than rebuilding it. The file can hold
+    # values no flag names -- `drive_file_ids` is authored by hand and is the only
+    # way to reach a table whose filename is not the canonical one -- and dropping
+    # one is not a cosmetic loss: that table then resolves to a freshly created empty
+    # file while the real one sits beside it, unread and unclaimed. So everything
+    # survives unless this command line actually named it, or `--reset-config` says
+    # otherwise out loud.
+    wanted = (Config().to_dict() if args.reset_config else base.to_dict())
+    wanted["backend"] = args.backend
+    if args.actor:
+        wanted["actor"] = args.actor
     if args.backend == "local":
         if not args.root:
             print("init: --root is required for a local database", file=sys.stderr)
             return 2
-        root = Path(args.root).expanduser()
-        cfg = Config(
-            backend="local", local_root=str(root), actor=args.actor,
-            token_path=base.token_path,
-            client_secret_path=base.client_secret_path,
-            service_account_path=base.service_account_path,
-        )
+        wanted["local_root"] = str(Path(args.root).expanduser())
     else:
         if not args.drive_folder:
             print("init: --drive-folder is required for a Drive backend", file=sys.stderr)
             return 2
-        cfg = Config(
-            backend=args.backend, drive_folder_id=args.drive_folder, actor=args.actor,
-            token_path=base.token_path,
-            client_secret_path=base.client_secret_path,
-            service_account_path=base.service_account_path,
-        )
+        # Resolved here, not left to __post_init__ (which quietly keeps a value it
+        # could not parse): a folder reference that names nothing is the one mistake
+        # worth catching before we ask a person to open a browser.
+        try:
+            wanted["drive_folder_id"] = parse_drive_folder(args.drive_folder)
+        except ValueError as exc:
+            print(f"init: --drive-folder: {exc}", file=sys.stderr)
+            return 2
+    cfg = Config.from_dict(wanted)
 
     if existed:
-        _warn_reset_fields(base, cfg, args.actor)
+        _announce_changes(base, cfg, reset=args.reset_config)
 
-    svc, created = init_database(cfg)
+    folder_name = ""
+    if cfg.is_drive:
+        rc = _authorise_drive(cfg, args)
+        if rc:
+            return rc
+        from .store.drive import verify_folder
+
+        try:
+            folder_name = verify_folder(cfg).get("name", "")
+        except (AuthError, StoreError) as exc:
+            print(f"init: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        svc, created = init_database(cfg)
+    except ForeignTableError as exc:
+        # Not a store malfunction: the target holds somebody else's files. Exit 2
+        # like the other ways to point init at the wrong thing, and say what to move.
+        print(f"init: {exc}", file=sys.stderr)
+        return 2
     wiped = ""
-    if args.reset:
+    if args.reset_db:
         from .seed import reset
 
         removed = reset(svc)
@@ -201,6 +237,18 @@ def _cmd_init(args) -> int:
     cfg_path = cfg.save(args.config)
     print(f"config written   {cfg_path}")
     print(f"backend          {cfg.backend}")
+    if cfg.is_drive:
+        # The name, because it is the only way to see that you got the folder you
+        # meant before a day of work lands in the wrong one.
+        print(f"drive folder     {folder_name or '(unnamed)'}  ({cfg.drive_folder_id})")
+    total = len(schema.TABLES)
+    if not created:
+        print(f"database         attached ({total} tables already present)")
+    elif len(created) == total:
+        print("database         created (empty)")
+    else:
+        print(f"database         attached ({total - len(created)} found, "
+              f"{len(created)} added)")
     print(f"tables created   {', '.join(created) if created else '(all present)'}")
     if wiped:
         print(f"rows discarded   {wiped}")
@@ -210,27 +258,75 @@ def _cmd_init(args) -> int:
     return 0
 
 
-def _warn_reset_fields(old: Config, new: Config, actor: str) -> None:
-    """Announce what re-running ``init`` takes away from an existing config.
+def _authorise_drive(cfg, args) -> int:
+    """Make sure Drive will answer before ``init`` creates anything. 0 to continue.
 
-    The file is rewritten whole from the command line plus the credential paths, so
-    every other field falls back to its default. Two of those are worth their noise:
-    ``drive_file_ids`` is hand-authored -- nothing in the code writes it, it is the
-    documented override for colliding table names -- and the Drive setup notes tell
-    people to re-run ``init`` after a read times out mid-setup, which is precisely
-    when an override would be sitting there waiting to be dropped.
+    The order used to be: build config, create the tables (which needs a token),
+    save the config last. On a fresh machine there is no token, so the command died
+    before the save -- and the error it printed told you to run ``auth``, which
+    refuses to run without a config. Each command's remedy was the other's
+    prerequisite, with no way out from either.
+
+    So authorising happens here, in the command that needs it. A consent flow needs
+    a terminal, so where there isn't one the config is written *first* and handed
+    back, which is what makes the follow-up ``auth`` runnable.
     """
-    asked = {"backend", "token_path", "client_secret_path", "service_account_path"}
-    asked |= {"local_root"} if new.backend == "local" else {"drive_folder_id"}
-    if actor:
-        asked.add("actor")
+    from .auth import authorize, credentials
+
+    try:
+        credentials(cfg, interactive=False)
+        return 0
+    except AuthError as exc:
+        print(f"drive: {exc}", file=sys.stderr)
+
+    if not sys.stdin.isatty():
+        path = cfg.save(args.config)
+        named = f"--config {args.config} " if args.config else ""
+        print(f"config written   {path}")
+        # stdout is block-buffered when piped, which would land that line after the
+        # instructions below and make the handoff read backwards.
+        sys.stdout.flush()
+        print("no terminal here for the browser consent step, so it is left to you. "
+              "In order:\n"
+              f"  inventory-mcp {named}auth     # once per machine; --manual if the "
+              "browser is on another computer\n"
+              "  then re-run this init command", file=sys.stderr)
+        return 2
+
+    print("running the one-time consent flow...")
+    sys.stdout.flush()
+    try:
+        token = authorize(cfg, manual=args.manual, port=args.port)
+    except AuthError as exc:
+        print(f"auth: {exc}", file=sys.stderr)
+        return 2
+    print(f"credentials saved  {token}")
+    return 0
+
+
+def _announce_changes(old: Config, new: Config, *, reset: bool = False) -> None:
+    """Say what re-running ``init`` actually moved in an existing config.
+
+    Usually nothing, and the silence is deliberate: this command is how every person on
+    every machine attaches to the database, so any routine noise here trains people to
+    skim past it. What does get named is a value that genuinely moved -- above all a
+    different folder or root, which is how you discover you have just repointed your
+    copy at somebody else's database.
+
+    This used to enumerate everything the file *lost*, because the whole file was
+    rebuilt from the command line each time and hand-authored fields such as
+    ``drive_file_ids`` fell off with it. It merges now, so losing one takes the
+    ``--reset-config`` flag -- and when it happens deliberately, every dropped value is
+    still listed, since that is the field whose loss can orphan a live table.
+    """
     before, after = old.to_dict(), new.to_dict()
-    reset = [f"{key}={before[key]!r} -> {after[key]!r}"
-             for key in before
-             if key not in asked and before[key] != after[key]]
-    if reset:
-        print("note: init rewrites the config; resetting " + ", ".join(reset),
-              file=sys.stderr)
+    changed = [f"{key}: {before[key]!r} -> {after[key]!r}"
+               for key in before
+               if before[key] != after[key]]
+    if not changed:
+        return
+    verb = "reset the config; discarding" if reset else "updated the config; changed"
+    print(f"note: init {verb} " + ", ".join(changed), file=sys.stderr)
 
 
 def _cmd_show_config(args) -> int:

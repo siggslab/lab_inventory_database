@@ -147,7 +147,7 @@ class DriveStoreBase(TableStore):
         resp = self._retry(
             self._drive.files().list(
                 q=f"'{self.folder_id}' in parents and trashed = false",
-                fields="files(id,name,mimeType,size,modifiedTime)",
+                fields="files(id,name,mimeType,size,modifiedTime,properties(title))",
                 pageSize=1000,
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
@@ -372,6 +372,31 @@ class DriveSheetsStore(DriveStoreBase):
 
     # -- reads / writes ------------------------------------------------------
 
+    def inspect_existing(self, name: str, spec) -> Optional[str]:
+        """Empty is ambiguous here, and only the creation marker resolves it.
+
+        A spreadsheet occupying one of our names with nothing in it is either a file
+        this app created moments ago, somebody's blank sheet, or a CSV that Drive
+        converted on upload -- which arrives as a single default tab holding nothing
+        we would recognise. Content cannot separate those; ``_create`` stamps our own
+        title into the file's properties, and nothing else carries it. Without this
+        check the converted-CSV case reads as an empty table of ours, so ``init``
+        finds nothing to complain about and the first commit renames the default tab
+        and writes over whatever was there.
+        """
+        detail = super().inspect_existing(name, spec)
+        if detail is not None or self.read_table(name).header:
+            return detail
+        want = self.object_name(schema.get_table(name))
+        fid = self.file_id(name)
+        entry = next((f for f in self._list_folder().values() if f.get("id") == fid), {})
+        stamped = (entry.get("properties") or {}).get("title")
+        if stamped != want:
+            return (f"the spreadsheet {fid} is empty and does not carry the title "
+                    f"marker this app stamps ({want!r}) -- it looks like a blank sheet "
+                    "or a converted upload wearing the table's name")
+        return detail
+
     def _fetch(self, name: str) -> TableData:
         fid, meta = self._meta(name)
         title = self.tab_name(name)
@@ -480,6 +505,59 @@ def _column_letter(width: int) -> str:
         width, rem = divmod(width - 1, 26)
         letters = chr(ord("A") + rem) + letters
     return letters or "A"
+
+
+def verify_folder(config) -> dict:
+    """Ask Drive for the folder itself, before anything is created in it.
+
+    Listing is not enough. A folder id that is wrong lists empty, which is exactly
+    what a correct-but-new folder looks like, so ``init`` proceeds and fails on its
+    first ``files().create`` with a parent Google has never heard of -- an error
+    naming neither the flag nor the folder. Reading the folder by id separates
+    "nothing in it yet" from "no such folder", and gives back its name, which is
+    how you tell the right folder from a similarly-named one.
+    """
+    folder = (getattr(config, "drive_folder_id", "") or "").strip()
+    if not folder:
+        raise StoreError("drive backends need drive_folder_id (a folder id or URL)")
+    try:
+        meta = drive_service(config).files().get(
+            fileId=folder, fields="id,name,mimeType,capabilities(canEdit)",
+            supportsAllDrives=True
+        ).execute()
+    except AuthError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - mapped below, by status
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        detail = getattr(exc, "reason", None) or str(exc)
+        if status == 404:
+            raise StoreError(
+                f"no such Drive folder: {folder}. Either the id is wrong or the "
+                "folder is not shared with the account that authorised. Open it in "
+                "the browser and copy the id from its URL."
+            ) from exc
+        if status == 403:
+            raise StoreError(
+                f"Drive would not show the folder {folder} to this account ({detail}). "
+                "It needs to be shared with that account, with edit access."
+            ) from exc
+        raise StoreError(f"could not read the Drive folder {folder} ({status}): {detail}") from exc
+    mime = meta.get("mimeType") or ""
+    if mime and mime != "application/vnd.google-apps.folder":
+        raise StoreError(
+            f"{folder} is a {mime.replace('application/vnd.google-apps.', '')}, not a "
+            "folder. Point --drive-folder at a folder; the table files go inside it."
+        )
+    # Only an explicit False counts: Drive omits capabilities it will not promise,
+    # and a missing key must not be read as "read-only".
+    if (meta.get("capabilities") or {}).get("canEdit") is False:
+        named = meta.get("name") or folder
+        raise StoreError(
+            f"the folder {named!r} is read-only for this account, and init has to "
+            "create spreadsheets inside it. Get edit access, or point "
+            "--drive-folder at a folder this account can write to."
+        )
+    return meta
 
 
 def _to_sheet(value: Any) -> Any:

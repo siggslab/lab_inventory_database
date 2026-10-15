@@ -5,6 +5,9 @@ config.json: a backend name from before a rename, a folder reference pasted from
 a browser bar, a key this version dropped. Each has to come back as a ConfigError
 that names the fix, because the CLI prints that message and nothing else -- an
 uncaught ValueError arrives as a traceback over a file the caller never opened.
+
+Nothing here reaches the network or reads a machine's own config: paths are explicit
+`tmp_path` arguments, and the folder id below is made up.
 """
 
 import json
@@ -13,7 +16,10 @@ import pytest
 
 from inventory_mcp.config import BACKENDS, Config, ConfigError, parse_drive_folder
 
-FOLDER_ID = "1ARN4XL0DgvLK1hmStk7X_CWKOmTgexKt"
+# Synthetic, same shape as a real id (33 chars of [A-Za-z0-9_-]). Nothing here talks to
+# Google -- these strings are only ever parsed -- but a live folder id in a test file
+# reads like an invitation to go looking.
+FOLDER_ID = "1FAKEFOLDERidforTests000000000000"
 
 
 def test_a_retired_backend_says_what_it_became():

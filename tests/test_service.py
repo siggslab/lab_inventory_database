@@ -1543,7 +1543,7 @@ class TestPaging:
 
 
 class TestReset:
-    """`init --reset --seed` recovery path: truncate, then seed from clean."""
+    """`init --reset-db --seed` recovery path: truncate, then seed from clean."""
 
     def test_reset_empties_tables_and_allows_reseed(self, config):
         from inventory_mcp import schema

@@ -47,7 +47,7 @@ inventory-mcp show-config
 In an existing database it adds only the tables that are missing.
 
 The `--seed` param can be passed to generate dummy testing data for the tables at initialisation. 
-The `--reset` param can be passed to discards every entry in the database. and re-initialise it from scratch.
+The `--reset-db` param can be passed to discards every entry in the database. and re-initialise it from scratch.
 
 **Destructive Flags**
 Note, as these two flags (seed, and particularly reset) are not used outside a development context, and 
@@ -227,20 +227,20 @@ JSON at `~/.config/inventory-mcp/config.json`, or `$INVENTORY_MCP_CONFIG`, or
 
 ## Command line Reference
 
-| Command | Purpose |
-| --- | --- |
-| `init` | create tables (`--root`, `--seed`, `--reset`, `--backend`, `--drive-folder`, `--actor`) |
-| `auth` | Drive consent once (`--manual`, `--port`, `--force`, `--check`) |
-| `serve` | run the MCP server over stdio |
-| `doctor` | integrity report; exit 1 when errors exist (`--json`, `--quiet`) |
-| `ls` | list items, or `--containers` |
-| `occupancy` | fill levels per container (`[container_id]`, `--kind`) |
-| `enrol` | give each sample's pairing its own enrolment row (`--from-ancestors`, `--dry-run`) |
-| `query` | guarded read-only SQL |
-| `export` | flat CSV views + SQLite mirror + manifest |
-| `schema` | the field-by-field reference (`--json`) |
-| `tools` | the live tool catalogue (`--json`) |
-| `show-config` | resolved configuration |
+| Command | Purpose                                                                                                                                      |
+| --- |----------------------------------------------------------------------------------------------------------------------------------------------|
+| `init` | Initialises config and create database tables (`--root`, `--seed`, `--reset-db`, `--reset-config`, `--backend`, `--drive-folder`, `--actor`) |
+| `auth` | Drive consent once (`--manual`, `--port`, `--force`, `--check`)                                                                              |
+| `serve` | run the MCP server over stdio                                                                                                                |
+| `doctor` | integrity report; exit 1 when errors exist (`--json`, `--quiet`)                                                                             |
+| `ls` | list items, or `--containers`                                                                                                                |
+| `occupancy` | fill levels per container (`[container_id]`, `--kind`)                                                                                       |
+| `enrol` | give each sample's pairing its own enrolment row (`--from-ancestors`, `--dry-run`)                                                           |
+| `query` | guarded read-only SQL                                                                                                                        |
+| `export` | flat CSV views + SQLite mirror + manifest                                                                                                    |
+| `schema` | the field-by-field reference (`--json`)                                                                                                      |
+| `tools` | the live tool catalogue (`--json`)                                                                                                           |
+| `show-config` | resolved configuration                                                                                                                       |
 
 ## Building a dashboard on this
 

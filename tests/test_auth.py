@@ -69,7 +69,12 @@ def test_no_client_anywhere_names_both_places_it_looked(tmp_path, monkeypatch):
 
 
 def test_a_non_interactive_caller_is_refused_not_hung(tmp_path):
-    """`serve` owns stdin; blocking on browser consent there looks like a hang."""
+    """`serve` owns stdin; blocking on browser consent there looks like a hang.
+
+    Needs the OAuth stack to exist at all -- without the `drive` extra the refusal is
+    the install hint instead, which is a different promise and a passing one.
+    """
+    pytest.importorskip("google.oauth2.credentials", reason="needs the 'drive' extra")
     cfg = Config(backend="drive", drive_folder_id="FOLDER",
                  token_path=str(tmp_path / "no-token.json"))
     with pytest.raises(AuthError, match="inventory-mcp auth"):
