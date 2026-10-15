@@ -63,8 +63,12 @@ shared drive
 ```bash
 source .venv/bin/activate
 inventory-mcp auth            # opens a browser on this machine
-inventory-mcp auth --manual   # headless: prints the URL, you paste the redirect back
 inventory-mcp auth --check    # verify the stored token without prompting
+```
+This automatically opens an authorisation prompt in browser. If you want to do this manually, you can pass the
+`--manual` flag and get a url to visit for authentication instead
+```bash
+inventory-mcp auth --manual   # headless: prints the URL, you paste the redirect back
 ```
 
 The token is cached at `~/.config/inventory-mcp/oauth_token.json`, mode `0600`. 
