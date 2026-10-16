@@ -12,19 +12,28 @@ run before a single file is written. See :func:`init_database`.
 
 from __future__ import annotations
 
+from typing import Callable, Optional
+
 from . import schema
 from .config import Config
 from .service import Service
 from .store.base import ForeignTableError
 
 
-def init_database(config: Config, store=None) -> tuple[Service, list[str]]:
+def init_database(config: Config, store=None,
+                  progress: Optional[Callable[[str], None]] = None) -> tuple[Service, list[str]]:
     """Write whichever tables are missing; return the service and what was created.
 
     Two passes, deliberately. Everything already present is classified first, and if
     any of it turns out not to be ours the run raises without having written a thing
     -- so refusing costs nothing, and nobody has to work out afterwards which tables
     made it in before the abort.
+
+    ``progress`` receives one line per unit of work. It is optional because this is a
+    library function whose callers include the MCP server; the CLI passes one for the
+    Drive backend, where every table here costs several round trips and the whole run
+    can take minutes -- long enough that silence stops reading as "fine" and starts
+    reading as "stuck".
     """
     svc = Service(config, store=store)
     underlying = svc.store
@@ -32,9 +41,15 @@ def init_database(config: Config, store=None) -> tuple[Service, list[str]]:
     if callable(ensure):
         ensure()
 
+    def say(message: str) -> None:
+        if progress is not None:
+            progress(message)
+
+    total = len(schema.TABLES)
     foreign: list[str] = []
     missing: list[schema.Table] = []
-    for spec in schema.TABLES:
+    for index, spec in enumerate(schema.TABLES, 1):
+        say(f"[{index:>2}/{total}] checking {spec.name}")
         if not underlying.exists(spec.name):
             missing.append(spec)
             continue
@@ -56,9 +71,14 @@ def init_database(config: Config, store=None) -> tuple[Service, list[str]]:
         )
 
     created: list[str] = []
-    for spec in missing:
+    for index, spec in enumerate(missing, 1):
+        say(f"[{index:>2}/{len(missing)}] creating {spec.name}")
         underlying.write_table(spec.name, spec.column_names, [], None)
         created.append(spec.name)
 
+    # The reload is not free -- it reads every table back through the store, which
+    # on Drive is another round trip per table -- and it is the phase with nothing
+    # else on screen while it runs, including on an attach where nothing was written.
+    say("reading the database back")
     svc.reload()
     return svc, created

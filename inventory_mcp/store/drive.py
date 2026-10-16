@@ -39,6 +39,7 @@ is reported by ``describe()`` rather than hidden.
 from __future__ import annotations
 
 import re
+import sys
 import time
 from typing import Any, Optional
 
@@ -77,6 +78,44 @@ _SHEET_TIMESTAMP_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 
+def note(message: str) -> None:
+    """Report something the operator should see while we are working.
+
+    stderr, unconditionally: stdout is the MCP protocol channel for ``serve``, and
+    this has to be callable from the store without knowing which command loaded it.
+    """
+    print(message, file=sys.stderr, flush=True)
+
+
+#: A quota window is one minute, so waiting past a minute buys nothing except an
+#: unresponsive-looking terminal. The old uncapped ladder reached 480 s on a single
+#: request, which is how a working command came to look broken.
+_MAX_WAIT = 60.0
+
+
+def _wait_for(exc: Exception, status: int, delay: float) -> float:
+    """How long to sit out a rejection: Google's number if it gave one, else ours.
+
+    A 429 here is the per-minute quota rather than a momentary hiccup, so its floor
+    is a window rather than the half-second the ladder starts at -- retrying
+    immediately would only spend the attempts on the same closed window.
+    """
+    resp = getattr(exc, "resp", None)
+    if hasattr(resp, "get"):
+        try:
+            stated = resp.get("retry-after")
+        except Exception:  # noqa: BLE001 - a header lookup must not choose the error path
+            stated = None
+        if stated is not None:
+            try:
+                return max(1.0, min(float(stated), _MAX_WAIT))
+            except (TypeError, ValueError):
+                pass  # an HTTP-date or nonsense value; fall back to our own ladder
+    if status == 429:
+        delay = max(delay, 30.0)
+    return min(delay, _MAX_WAIT)
+
+
 class DriveStoreBase(TableStore):
     kind = "drive"
 
@@ -100,7 +139,13 @@ class DriveStoreBase(TableStore):
         return f"{self.kind}:drive-folder:{self.folder_id}"
 
     def _retry(self, request, *, attempts: int = 8):
-        """Run an ApiRequest, backing off on the transient statuses."""
+        """Run an ApiRequest, backing off on the transient statuses -- out loud.
+
+        Being rate limited is routine here and worth sleeping through; what is not
+        acceptable is sleeping silently. A minute of quiet looks exactly like a
+        wedged command, and the operator has nothing to check but whether the
+        process is still alive.
+        """
         delay = 0.5
         for i in range(attempts):
             try:
@@ -110,12 +155,10 @@ class DriveStoreBase(TableStore):
                 if status is None and HttpError is not None and isinstance(exc, HttpError):
                     status = exc.resp.status if getattr(exc, "resp", None) else None
                 if status in _RETRY_STATUS and i < attempts - 1:
-                    # Sheets quota is 60 reads/min/user; waiting 30s+ lets the
-                    # window reset rather than burning through retries.
-                    if status == 429:
-                        time.sleep(max(delay, 30))
-                    else:
-                        time.sleep(delay)
+                    wait = _wait_for(exc, status, delay)
+                    note(f"drive: {status} from Google, waiting {wait:.0f}s "
+                         f"(attempt {i + 2} of {attempts})")
+                    time.sleep(wait)
                     delay *= 2
                     continue
                 raise self._as_store_error(exc) from exc

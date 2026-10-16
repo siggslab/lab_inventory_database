@@ -63,8 +63,9 @@ def drive_seams(monkeypatch, tmp_path):
         calls["verify"].append(config.drive_folder_id)
         return {"id": config.drive_folder_id, "name": "Lab inventory"}
 
-    def init_database(config, store=None):
+    def init_database(config, store=None, progress=None):
         calls["created"].append(config.drive_folder_id)
+        calls["progress"] = progress
         return _FakeService(), ["items"]
 
     monkeypatch.setattr(auth, "credentials", credentials)
@@ -267,6 +268,44 @@ def test_a_folder_that_is_not_there_stops_before_anything_is_written(
     assert "no such Drive folder" in capsys.readouterr().err
     assert not drive_seams["created"]
     assert not cfg_path.exists()
+
+
+def test_drive_setup_names_the_table_it_is_working_on(tmp_path, capsys, drive_seams, monkeypatch):
+    """Minutes of silence are what made a working command look broken.
+
+    The lines themselves come from `init_database`; under test here is that `init`
+    hands it a sink that reaches the terminal, on stderr so the report below stays
+    clean to pipe, and only when the backend is slow enough for silence to mislead.
+    """
+    from inventory_mcp import initdb
+
+    def chatty(config, store=None, progress=None):
+        assert progress is not None, "Drive setup has to be given a progress sink"
+        progress("[ 1/12] checking items")
+        progress("reading the database back")
+        return _FakeService(), ["items"]
+
+    monkeypatch.setattr(cli.sys, "stdin", _Terminal(tty=True))
+    monkeypatch.setattr(initdb, "init_database", chatty)
+    assert _init_drive(tmp_path / "db.config.json", "--drive-folder", FOLDER_ID) == 0
+    err = capsys.readouterr().err
+    assert "checking items" in err and "reading the database back" in err
+
+
+def test_local_setup_stays_quiet_because_it_is_fast(tmp_path, capsys, monkeypatch):
+    """The absence of progress is information too: nothing is happening slowly."""
+    from inventory_mcp import initdb
+
+    seen = []
+
+    def quiet(config, store=None, progress=None):
+        seen.append(progress)
+        return _FakeService(), []
+
+    monkeypatch.setattr(initdb, "init_database", quiet)
+    assert _init(tmp_path / "db.config.json", tmp_path / "db") == 0
+    assert capsys.readouterr().err == ""
+    assert callable(seen[0]), "the callback is still passed; it just has nothing to say"
 
 
 def test_init_refuses_to_adopt_a_file_that_is_not_ours(tmp_path, capsys):

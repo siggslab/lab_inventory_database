@@ -213,8 +213,18 @@ def _cmd_init(args) -> int:
             print(f"init: {exc}", file=sys.stderr)
             return 2
 
+    # Progress goes to stderr so the report below stays clean to pipe, and only for
+    # Drive: local setup reads a dozen files and is finished before you notice, so
+    # its silence is accurate. Over Drive the same work is a hundred-odd round trips
+    # and can run into minutes once the quota starts answering with 429s -- long
+    # enough that saying nothing is indistinguishable from being stuck.
+    def progress(message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
+
+    say = progress if cfg.is_drive else (lambda message: None)
+
     try:
-        svc, created = init_database(cfg)
+        svc, created = init_database(cfg, progress=say)
     except ForeignTableError as exc:
         # Not a store malfunction: the target holds somebody else's files. Exit 2
         # like the other ways to point init at the wrong thing, and say what to move.
@@ -224,14 +234,17 @@ def _cmd_init(args) -> int:
     if args.reset_db:
         from .seed import reset
 
+        say("discarding every row")
         removed = reset(svc)
         wiped = ", ".join(f"{k}={v}" for k, v in removed.items()) or "(nothing to discard)"
     seeded = ""
     if args.seed:
         from .seed import seed
 
+        say("writing the example database")
         counts = seed(svc)
         seeded = ", ".join(f"{k}={v}" for k, v in counts.items())
+    say("checking integrity")
     report = svc.doctor()
 
     cfg_path = cfg.save(args.config)

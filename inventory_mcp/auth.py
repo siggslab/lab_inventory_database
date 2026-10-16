@@ -25,6 +25,7 @@ import os
 import webbrowser
 from pathlib import Path
 from typing import Optional
+from urllib import parse as urlparse
 
 #: Full Drive scope. The narrower ``drive.file`` only covers files this app
 #: created itself, which is useless for pointing at a folder that already exists;
@@ -190,7 +191,7 @@ def _run_flow(InstalledAppFlow, secret: Path, *, manual: bool, port: int):
     # short-lived access token and every session after the first needs a browser.
     if manual:
         flow.redirect_uri = f"http://localhost:{port}/"
-        url, _state = flow.authorization_url(prompt="consent")
+        url, state = flow.authorization_url(prompt="consent")
         print(
             "Open this URL in any browser, approve, then copy the address bar of\n"
             "the page it lands on -- even if that page fails to load -- and paste\n"
@@ -210,13 +211,15 @@ def _run_flow(InstalledAppFlow, secret: Path, *, manual: bool, port: int):
             ) from exc
         if not response:
             raise AuthError("nothing pasted; authorisation cancelled")
+        code = _code_from_redirect(response, expected_state=state, port=port)
         try:
-            flow.fetch_token(authorization_response=response)
+            # Exchanged by code, not by the redirect URL -- see
+            # :func:`_code_from_redirect` for why the URL cannot be handed over.
+            flow.fetch_token(code=code)
         except Exception as exc:
             raise AuthError(
-                f"could not exchange that redirect for a token: {exc}. Make sure you "
-                "pasted the whole URL from the failed redirect, promptly -- codes "
-                "expire in about a minute."
+                f"Google refused that code: {exc}. Codes last about a minute, so "
+                "re-run and paste it promptly."
             ) from exc
         creds = flow.credentials
     else:
@@ -234,6 +237,53 @@ def _run_flow(InstalledAppFlow, secret: Path, *, manual: bool, port: int):
     if not creds or not creds.valid:
         raise AuthError("the flow completed but produced no usable credentials")
     return creds
+
+
+def _code_from_redirect(pasted: str, *, expected_state: str, port: int) -> str:
+    """The authorization code inside whatever came back from the browser.
+
+    The exchange has to be handed a code rather than the redirect URL, because
+    oauthlib refuses to *parse* an ``http://`` authorization response: it checks the
+    scheme of the URI it is given, and a loopback redirect is http by definition
+    (RFC 8252 §7.3). That check happens before any request leaves the machine, so
+    the failure looks like a bad paste when nothing was pasted wrong. Google's own
+    library sidesteps it in the browser flow by rewriting the scheme to https
+    before handing the URL over; parsing it here instead keeps the URI honest, and
+    buys the ability to name each way this goes wrong -- which matters because a
+    person is typing this under a one-minute clock.
+
+    The state is checked here for the same reason: it is the one thing that proves
+    the paste belongs to this attempt, and it is worthless if nobody looks at it.
+    """
+    if "://" not in pasted and "?" not in pasted:
+        # Just the code. Nothing carries a state to check, and there is no
+        # attacker who can slip a code into a terminal prompt.
+        return pasted
+
+    query = urlparse.parse_qs(urlparse.urlparse(pasted).query)
+    if "error" in query:
+        why = (query.get("error_description") or [""])[0]
+        name = query["error"][0]
+        raise AuthError(f"Google reported {name}" + (f": {why}" if why else ""))
+
+    got = (query.get("state") or [""])[0]
+    if got != expected_state:
+        raise AuthError(
+            "that redirect carries no state, or the state of a different "
+            "authorisation attempt -- its code would be exchanged against the "
+            "wrong PKCE verifier anyway. Re-run and paste the whole address bar "
+            f"of the page the browser landed on (it starts http://localhost:{port}/)."
+        )
+
+    code = (query.get("code") or [""])[0]
+    if not code:
+        raise AuthError(
+            "no authorization code in what you pasted. It should be the address "
+            f"bar of the page the browser reached after approving -- usually a page "
+            f"that fails to load, starting http://localhost:{port}/ -- not the link "
+            "this command printed."
+        )
+    return code
 
 
 def _save_token(path: Path, payload: str) -> None:

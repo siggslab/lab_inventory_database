@@ -435,10 +435,17 @@ class TestDriveSheets:
         blind = [name for name, kw in drive.calls if not kw.get("supportsAllDrives")]
         assert not blind, f"these would 404 in a shared drive: {blind}"
 
-    def test_transient_errors_are_retried(self, config, drive):
+    def test_transient_errors_are_retried(self, config, drive, monkeypatch):
+        """Retried, and retried *after* a quota window -- asserted without sitting
+        through it, which used to make this the slowest test in the suite."""
+        from inventory_mcp.store import drive as drive_module
+
+        slept: list[float] = []
+        monkeypatch.setattr(drive_module.time, "sleep", slept.append)
         store = sheets_store(config, drive)
         drive.fail_next = [HttpErr(429)]
         assert store.write_table("items", ("item_id",), [{"item_id": "smp_aaaaaaaa"}], None)
+        assert slept, "a 429 should be waited out, not burned through attempts"
 
     def test_permanent_error_becomes_a_readable_store_error(self, config, drive):
         store = sheets_store(config, drive)
@@ -697,3 +704,81 @@ class TestAdoption:
         drive.add("containers", mime=SHEET, sheet=drifted, parent="FOLDERID")
         _, created = self._init(config, drive)
         assert "containers" not in created, "adopted as ours despite the older spelling"
+
+
+class TestWaitingOutQuota:
+    """What happens -- and what is said -- when Google says not yet.
+
+    Being rate limited is ordinary here, and sleeping through it is right. Sleeping
+    *silently* is not: an `init` that says nothing for four minutes is
+    indistinguishable from one that is wedged, which is exactly how it was reported.
+    Both halves are pinned -- the wait is announced, and it is bounded, because the
+    ladder this replaced reached 480 s on a single request.
+    """
+
+    @staticmethod
+    def _flaky(*errors, result="ok"):
+        class Flaky:
+            def __init__(self):
+                self.left = list(errors)
+
+            def execute(self, num_retries=0):
+                if self.left:
+                    raise self.left.pop(0)
+                return result
+
+        return Flaky()
+
+    @staticmethod
+    def _rejected(status, **headers):
+        """An API error shaped like the real one, headers included.
+
+        ``resp`` subclasses dict because that is how httplib2 presents a response --
+        ``Retry-After`` is read with ``.get``, so a bare attribute-only stand-in
+        would leave that path untested.
+        """
+        exc = Exception(f"status {status}")
+        exc.resp = type("R", (dict,), {"status": status})(headers)
+        exc.reason = ""
+        return exc
+
+    @pytest.fixture
+    def waits(self, monkeypatch):
+        """Collect the sleeps instead of sitting through them."""
+        from inventory_mcp.store import drive as drive_module
+
+        slept: list[float] = []
+        monkeypatch.setattr(drive_module.time, "sleep", slept.append)
+        return slept
+
+    def test_a_quota_wait_is_announced(self, config, drive, waits, capsys):
+        store = sheets_store(config, drive)
+        assert store._retry(self._flaky(HttpErr(429))) == "ok"
+        assert waits and waits[0] >= 30, (
+            "the quota window is a minute; retrying sooner only spends attempts")
+        err = capsys.readouterr().err
+        assert "429" in err and "waiting" in err, "an unannounced wait looks like a hang"
+
+    def test_the_server_says_how_long_so_we_wait_that(self, config, drive, waits):
+        store = sheets_store(config, drive)
+        store._retry(self._flaky(self._rejected(503, **{"retry-after": "7"})))
+        assert waits == [7.0], "Google's own number beats our guess"
+
+    def test_a_wait_never_runs_past_a_quota_window(self, config, drive, waits):
+        """Whatever is asked for, sitting out more than a minute buys nothing and
+        costs the operator an unresponsive-looking command."""
+        store = sheets_store(config, drive)
+        store._retry(self._flaky(self._rejected(429, **{"retry-after": "3600"})))
+        assert waits == [60.0]
+
+    def test_an_unparseable_header_falls_back_to_our_ladder(self, config, drive, waits):
+        store = sheets_store(config, drive)
+        store._retry(self._flaky(self._rejected(429, **{"retry-after": "Thu, 01 Jan 2026 00:00:00 GMT"})))
+        assert waits == [30.0]
+
+    def test_giving_up_still_costs_no_more_than_a_few_minutes(self, config, drive, waits):
+        store = sheets_store(config, drive)
+        with pytest.raises(StoreError):
+            store._retry(self._flaky(*[self._rejected(429) for _ in range(8)]))
+        assert len(waits) == 7, "eight attempts, seven waits"
+        assert sum(waits) <= 7 * 60, f"bounded ladder, got {sum(waits)}s"
