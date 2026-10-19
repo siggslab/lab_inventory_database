@@ -118,13 +118,39 @@ class TableStore(ABC):
     def current_revision(self, name: str) -> Optional[str]:
         """Current revision without materialising rows; None if absent."""
 
+    def read_all(self) -> dict[str, TableData]:
+        """Every table, fetched however this backend does it cheapest.
+
+        The loop below is what a file-per-table backend does anyway. A backend where
+        one request can cover many tables overrides it, because ``db.load`` reads the
+        whole database on every reload and twelve round trips there is the difference
+        between a command that answers and one that looks stuck.
+        """
+        return {name: self.read_table(name) for name in self.list_tables()}
+
+    def write_batch(self, changes, written: Optional[dict] = None) -> dict[str, str]:
+        """Write several tables at once; ``changes`` is ``(name, header, rows, expected)``.
+
+        Returns ``{table: new revision}``. ``written``, when given, is filled in as
+        each table lands so the caller can put back what arrived when a later table in
+        the same batch refuses -- a backend that applies everything in one request
+        fills it once, at the point where everything has landed or nothing has.
+        """
+        out: dict[str, str] = {}
+        for name, header, rows, expected in changes:
+            out[name] = self.write_table(name, header, rows, expected)
+            if written is not None:
+                written[name] = out[name]
+        return out
+
     def exists(self, name: str) -> bool:
         try:
             return self.current_revision(name) is not None
         except StoreError:
             return False
 
-    def inspect_existing(self, name: str, spec) -> Optional[str]:
+    def inspect_existing(self, name: str, spec,
+                         data: Optional[TableData] = None) -> Optional[str]:
         """Why this existing object must not be adopted; ``None`` if it may.
 
         Called by ``init`` for every table already present in the target, before it
@@ -135,11 +161,17 @@ class TableStore(ABC):
         renamed under us -- is precisely the state where writing would clobber
         something real, so an unreadable table counts as foreign and its error text
         becomes the reason.
+
+        ``data`` is whatever the caller already read. ``init`` passes the one bulk
+        read it made for this purpose, because on a backend where a single request
+        covers every table, asking for them one at a time here costs twelve requests
+        to answer a question worth one.
         """
-        try:
-            data = self.read_table(name)
-        except StoreError as exc:
-            return str(exc)
+        if data is None:
+            try:
+                data = self.read_table(name)
+            except StoreError as exc:
+                return str(exc)
         if not data.header:
             return None  # nothing in it; adopting costs nothing
         if not looks_like_ours(data.header, spec):

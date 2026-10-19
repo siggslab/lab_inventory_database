@@ -42,6 +42,13 @@ DIMENSIONS: dict[str, Dimension] = {
             "microliter": 1.0,
             "microlitre": 1.0,
             "l": 1e6,
+            # ``_prefixed`` assigns its factors by position in the prefix tuple, so
+            # it treats n and p as steps *up* from a litre. Every key it gets wrong
+            # is corrected here; these two were missing until 2026-10-19, which made
+            # 1 nl convert as 1e12 ul -- fifteen orders of magnitude out, silently,
+            # because an unknown unit fails loudly and a wrong one does not.
+            "nl": 1e-3,
+            "pl": 1e-6,
         },
     ),
     "mass": Dimension(

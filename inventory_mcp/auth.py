@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib import parse as urlparse
@@ -31,6 +32,68 @@ from urllib import parse as urlparse
 #: created itself, which is useless for pointing at a folder that already exists;
 #: restricting writes to that folder is our job, not the token's.
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+#: Setup-only permissions, requested only by a command run with ``--admin``.
+#:
+#: ``script.projects`` lets ``ui --install`` write the Apps Script project bound to a
+#: workbook, which is the only way a button gets anything to bind to. No everyday
+#: action needs it, and it is not the permission the *sheet* asks for either: that is
+#: a separate consent each editor gives when they first click the menu, and it stays
+#: at ``spreadsheets.currentonly``. Keeping this out of the default list is what stops
+#: a bench person's consent screen from offering Google an Apps Script write permission
+#: they have no possible use for.
+ADMIN_SCOPES = ["https://www.googleapis.com/auth/script.projects"]
+
+
+def scopes_for(admin: bool = False) -> list[str]:
+    """The scopes to ask for. Admin grants are additive, so one token can carry both."""
+    return list(SCOPES) + (list(ADMIN_SCOPES) if admin else [])
+
+
+def missing_scopes(granted, wanted) -> list[str]:
+    """Which of ``wanted`` this grant does not cover.
+
+    A stored token records what a human actually consented to, and Google answers a
+    call outside that set with ``ACCESS_TOKEN_SCOPE_INSUFFICIENT`` -- an error naming
+    neither the token file nor the fix, because as far as it is concerned the token is
+    perfectly valid. Comparing the two here is what turns that into "re-run auth".
+    """
+    have = {str(scope).strip() for scope in (granted or [])}
+    return [scope for scope in wanted if scope not in have]
+
+
+def recorded_scopes(path: Path) -> Optional[list[str]]:
+    """The scopes a saved token file says were consented to; None if it does not say.
+
+    This has to come from the file rather than from a ``Credentials`` object:
+    ``from_authorized_user_file`` puts the scopes *you passed in* onto the object, so
+    asking it for the Drive scope hands back a credential claiming the Drive scope no
+    matter what was ever consented to. Checking that against what we asked for would
+    compare a value with itself and always pass.
+
+    None means an older or hand-written file with no record. Nothing is asserted about
+    it -- Google gets to be the authority, and its answer arrives at the call site.
+    """
+    import json
+
+    try:
+        info = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(info, dict) or "scopes" not in info:
+        return None
+    scopes = info.get("scopes") or []
+    return [str(scope).strip() for scope in scopes] if isinstance(scopes, list) else []
+
+
+def _scope_error(gaps: list[str]) -> AuthError:
+    """Built when raised, so it reflects the flags as they are now."""
+    admin = " --admin" if any(gap in ADMIN_SCOPES for gap in gaps) else ""
+    return AuthError(
+        f"the stored token does not cover: {', '.join(gaps)}.\n"
+        "A consent cannot be widened in place, it has to be re-given. Run once:\n"
+        f"  inventory-mcp auth{admin} --force"
+    )
 
 
 class AuthError(RuntimeError):
@@ -96,13 +159,18 @@ def _require_oauth():
 
 
 def credentials(config, *, interactive: bool = False, manual: bool = False,
-                port: int = 8080, force: bool = False):
+                port: int = 8080, force: bool = False, admin: bool = False):
     """Return usable Google credentials for ``config``.
 
     Order of preference: a service-account key if one is configured, otherwise a
     cached OAuth token, otherwise -- only when ``interactive`` -- run the flow.
     Non-interactive callers get an actionable error instead of a hang, because
     they are usually the stdio server with no terminal to ask in.
+
+    ``admin`` asks for the setup-only scopes as well. It changes nothing about what
+    the returned credentials may do beyond what was consented to; it is a request, and
+    a token minted without the flag simply fails the check below with the command that
+    would fix it.
     """
     sa = getattr(config, "service_account_path", "") or ""
     if sa and Path(sa).expanduser().exists():
@@ -114,16 +182,20 @@ def credentials(config, *, interactive: bool = False, manual: bool = False,
 
     Request, Credentials, InstalledAppFlow = _require_oauth()
     token = Path(config.token_path).expanduser()
+    wanted = scopes_for(admin)
 
     if not force and token.exists():
         try:
-            creds = Credentials.from_authorized_user_file(str(token), SCOPES)
+            creds = Credentials.from_authorized_user_file(str(token), wanted)
         except (ValueError, OSError) as exc:
             raise AuthError(
                 f"token file {token} is unreadable ({exc}); re-run:  inventory-mcp auth --force"
             ) from exc
         if creds.valid or (creds.expired and creds.refresh_token):
             if creds.expired and creds.refresh_token:
+                # Read before the refresh writes: this is the last moment the file still
+                # says what the human actually consented to.
+                consented = recorded_scopes(token)
                 try:
                     creds.refresh(Request())
                 except Exception as exc:  # google.auth.exceptions.RefreshError et al
@@ -133,8 +205,28 @@ def credentials(config, *, interactive: bool = False, manual: bool = False,
                         "Testing and its refresh tokens expired. Re-run:  "
                         "inventory-mcp auth --force"
                     ) from exc
-                _save_token(token, creds.to_json())
-            if creds.valid:
+                _save_token(token, _refreshed_payload(creds, consented))
+            recorded = recorded_scopes(token)
+            # None means the file records nothing about its own grant -- an older write,
+            # or one a person made by hand. Inventing a gap there would refuse a token
+            # that may work perfectly well, so the check abstains and Google decides.
+            gaps = missing_scopes(recorded, wanted) if recorded is not None else []
+            if gaps and getattr(creds, "refresh_token", None):
+                # The record can be narrower than the grant behind it -- see
+                # :func:`_refreshed_payload` for how that happens -- so before demanding a
+                # consent, ask the token server what it will actually honour. One round trip
+                # beats sending someone through a browser to re-approve what they approved.
+                live = _live_grant(creds, Request, token)
+                if live:
+                    gaps = missing_scopes(live, wanted)
+            if gaps:
+                # A token good for Drive is not good for the Script API, and the two
+                # failures look identical from Google's side. Asking again is the only
+                # remedy, so say so rather than falling through to a silent browser
+                # launch in a process that may not have one.
+                if not interactive:
+                    raise _scope_error(gaps)
+            elif creds.valid:
                 return creds
         # else fall through to a fresh consent
 
@@ -145,13 +237,13 @@ def credentials(config, *, interactive: bool = False, manual: bool = False,
             "   (add --manual if the browser is not on this machine)"
         )
 
-    creds = _run_flow(InstalledAppFlow, secret, manual=manual, port=port)
+    creds = _run_flow(InstalledAppFlow, secret, manual=manual, port=port, scopes=wanted)
     _save_token(token, creds.to_json())
     return creds
 
 
 def authorize(config, *, manual: bool = False, port: int = 8080,
-              force: bool = False) -> Path:
+              force: bool = False, admin: bool = False) -> Path:
     """Interactive entry point for ``inventory-mcp auth``; returns the token path."""
     sa = getattr(config, "service_account_path", "") or ""
     if sa and Path(sa).expanduser().exists():
@@ -162,10 +254,16 @@ def authorize(config, *, manual: bool = False, port: int = 8080,
     secret = resolve_client_secret(config)
     if not secret.is_file():
         raise _missing_client_error(config)
-    creds = _run_flow(InstalledAppFlow, secret, manual=manual, port=port)
+    creds = _run_flow(InstalledAppFlow, secret, manual=manual, port=port,
+                      scopes=scopes_for(admin))
     token = Path(config.token_path).expanduser()
     _save_token(token, creds.to_json())
     return token
+
+
+def granted_scopes(config) -> list[str]:
+    """What the stored token actually covers, for reporting after a consent."""
+    return sorted(recorded_scopes(Path(config.token_path).expanduser()) or [])
 
 
 def _service_account_credentials(path: str):
@@ -179,9 +277,10 @@ def _service_account_credentials(path: str):
         raise AuthError(f"service account key {path!r} could not be loaded: {exc}") from exc
 
 
-def _run_flow(InstalledAppFlow, secret: Path, *, manual: bool, port: int):
+def _run_flow(InstalledAppFlow, secret: Path, *, manual: bool, port: int,
+              scopes: Optional[list[str]] = None):
     try:
-        flow = InstalledAppFlow.from_client_secrets_file(str(secret), SCOPES)
+        flow = InstalledAppFlow.from_client_secrets_file(str(secret), scopes or SCOPES)
     except Exception as exc:
         raise AuthError(
             f"{secret} is not a usable installed-app client secret: {exc}"
@@ -286,6 +385,54 @@ def _code_from_redirect(pasted: str, *, expected_state: str, port: int) -> str:
     return code
 
 
+def _refreshed_payload(creds, consented) -> str:
+    """The refreshed token, recording the grant rather than the request.
+
+    The write direction of the same trap as :func:`recorded_scopes`. google-auth holds two
+    lists: ``scopes`` is what the caller asked for -- ``from_authorized_user_file`` stamps it
+    in, and a refresh does not change it -- while ``granted_scopes`` is the ``scope`` field
+    from the server's own reply. ``to_json()`` serialises the first and drops the second, so
+    saving it verbatim lets an ordinary ``doctor`` run shave the setup scope off the record on
+    any day the access token happens to be stale. That is not hypothetical: it is how a token
+    holding ``script.projects`` came to be filed as Drive-only here.
+
+    So: believe the server when it speaks, and otherwise keep what the human consented to.
+    Never write our own request back as if it were a grant.
+    """
+    import json
+
+    payload = json.loads(creds.to_json())
+    asked = [str(scope).strip() for scope in (payload.get("scopes") or [])]
+    # Empty granted_scopes means "same as requested", per the library's own docstring, not
+    # "nothing was granted" -- hence the fallback rather than trusting an empty list.
+    granted = [str(scope).strip() for scope in (getattr(creds, "granted_scopes", None) or [])]
+    payload["scopes"] = sorted(set(granted)) if granted else sorted(set(asked) | set(consented or []))
+    return json.dumps(payload)
+
+
+def _live_grant(creds, Request, token: Path):
+    """Ask the token server what this refresh token can still get, when it is cheap to ask.
+
+    Worth one round trip because the alternative is demanding a consent nobody revoked: the
+    file's record can be narrower than the grant it stands for, and ``--admin`` reads the
+    record. Returns the scope list Google named, or None if it wouldn't say.
+    """
+    try:
+        creds.expiry = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        # ``refresh`` posts regardless; resetting the expiry keeps the intent legible and
+        # stops a later version from treating a still-valid token as a reason to skip it.
+        creds.refresh(Request())
+    except Exception:  # noqa: BLE001 - a failed probe leaves the local answer standing
+        return None
+    # Only the server's own reply counts here. ``creds.scopes`` is what *we* asked for, so
+    # reading it would compare our request with our request and wave through every gap --
+    # the same self-referential check that :func:`recorded_scopes` exists to avoid.
+    scopes = [str(scope).strip() for scope in (getattr(creds, "granted_scopes", None) or [])]
+    if scopes:
+        _save_token(token, _refreshed_payload(creds, scopes))
+    return scopes or None
+
+
 def _save_token(path: Path, payload: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(payload, encoding="utf-8")
@@ -308,12 +455,22 @@ def sheets_service(config, **kwargs):
     return _build(config, "sheets", "v4", **kwargs)
 
 
-def _build(config, api: str, version: str, **kwargs):
+def script_service(config, **kwargs):
+    """The Apps Script API, which needs the setup-only scope to be worth calling.
+
+    Requesting the credentials with ``admin=True`` here rather than at the call site
+    is what makes ``ui --install`` fail with "run auth --admin --force" instead of a
+    Google error about an otherwise perfectly good token.
+    """
+    return _build(config, "script", "v1", admin=True, **kwargs)
+
+
+def _build(config, api: str, version: str, admin: bool = False, **kwargs):
     try:
         from googleapiclient.discovery import build
     except ImportError as exc:  # pragma: no cover
         raise AuthError(_INSTALL_HINT) from exc
-    creds = credentials(config, interactive=False)
+    creds = credentials(config, interactive=False, admin=admin)
     try:
         return build(api, version, credentials=creds, cache_discovery=False, **kwargs)
     except ValueError as exc:

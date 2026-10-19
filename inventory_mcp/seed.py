@@ -14,6 +14,17 @@ from .service import Service
 
 
 def seed(svc: Service) -> dict:
+    """Fill an empty database with the example inventory.
+
+    Every row goes through the ordinary write path, so seeding takes one pre-write
+    copy of the database rather than one per record -- thirty-odd copies to undo a
+    single "fill this folder" would be noise, and on Drive thirty-odd extra requests.
+    """
+    with svc.bulk("seed"):
+        return _seed(svc)
+
+
+def _seed(svc: Service) -> dict:
     # -- assays ---------------------------------------------------------------
     assays = [
         ("qubit_dsdna", "Qubit dsDNA HS concentration", "concentration_mass", "ng/ul", "numeric",
@@ -203,16 +214,24 @@ def reset(svc: Service) -> dict:
 
     A Drive session cut off by the Sheets quota can leave half a seed behind,
     and re-seeding then trips the duplicate guards. This is the recovery path
-    rather than deleting files: truncate and start over. On Drive the version
-    history is the only undo, so this belongs on a test database, not prod.
+    rather than deleting files: truncate and start over, with one pre-write copy
+    of the database taken first -- so this is recoverable too, but it still
+    belongs on a test database.
     """
     removed: dict[str, int] = {}
+    changes = []
     for spec in schema.TABLES:
         t = svc.db.t(spec.name)
         if t.missing or not t.rows:
             continue
-        svc.store.write_table(spec.name, t.header, [], t.revision or None)
+        changes.append((spec.name, t.header, [], t.revision or None))
         removed[spec.name] = len(t.rows)
+    if changes:
+        with svc.bulk("reset"):
+            # One batch: on Drive this was twelve round trips per reset, which is
+            # long enough to look like a hang and long enough to get rate limited
+            # part-way through.
+            svc.store.write_batch(changes)
     svc.reload()
     return removed
 

@@ -100,25 +100,25 @@ def test_init_creates_the_config_it_was_asked_to_write(tmp_path, capsys):
 def test_rerunning_init_keeps_what_the_command_line_never_named(tmp_path, capsys):
     """`init` merges into the config instead of rebuilding it.
 
-    Not a nicety. `drive_file_ids` is authored by hand and is the only way to reach a
-    table whose filename is not the canonical one; dropping it makes that table resolve
-    to a newly created empty file while the real one sits beside it, unread. A warning
-    was never much protection, because the person who set the override is rarely the
-    person re-running setup.
+    Not a nicety. `drive_spreadsheet_id` is authored by hand when the workbook is not
+    findable by name -- somebody else's folder, a renamed file -- and dropping it makes
+    the next init resolve by name, miss, and build a second empty workbook beside the
+    real one. A warning was never much protection, because the person who set the
+    override is rarely the person re-running setup.
     """
     cfg_path = tmp_path / "db.config.json"
     assert _init(cfg_path, tmp_path / "db", "--actor", "you") == 0
     capsys.readouterr()
 
     raw = json.loads(cfg_path.read_text())
-    raw.update(cache_ttl_seconds=99.0, keep_backups=3, drive_file_ids={"items": "FILEID"})
+    raw.update(cache_ttl_seconds=99.0, keep_backups=3, drive_spreadsheet_id="FILEID")
     cfg_path.write_text(json.dumps(raw))
 
     assert _init(cfg_path, tmp_path / "db", "--actor", "you") == 0
     captured = capsys.readouterr()
     after = Config.load(cfg_path)
-    assert (after.cache_ttl_seconds, after.keep_backups, after.drive_file_ids) == (
-        99.0, 3, {"items": "FILEID"}), "hand-authored values have to survive setup"
+    assert (after.cache_ttl_seconds, after.keep_backups, after.drive_spreadsheet_id) == (
+        99.0, 3, "FILEID"), "hand-authored values have to survive setup"
     assert captured.err == "", "nothing moved, so nothing to say"
 
 
@@ -138,25 +138,26 @@ def test_init_names_a_value_that_genuinely_moved(tmp_path, capsys):
 def test_reset_config_discards_hand_edited_values_and_says_which(tmp_path, capsys):
     """Merging is the default; this is the opt-out, and it still itemises the damage.
 
-    The listing matters even when the flag was typed on purpose: `drive_file_ids` is the
-    field whose loss leaves a table resolving to an empty file while its real data sits
-    beside it unclaimed, so the person resetting should see it named before they go
-    hunting for vanished rows.
+    The listing matters even when the flag was typed on purpose: `drive_spreadsheet_id`
+    is the field whose loss sends init looking for a workbook by name, so resetting it
+    quietly can point somebody at an empty file they did not create. The person resetting
+    should see it named before they go hunting for vanished rows.
     """
     cfg_path = tmp_path / "db.config.json"
     assert _init(cfg_path, tmp_path / "db", "--actor", "you") == 0
     raw = json.loads(cfg_path.read_text())
-    raw.update(cache_ttl_seconds=99.0, keep_backups=3, drive_file_ids={"items": "FILEID"})
+    raw.update(cache_ttl_seconds=99.0, keep_backups=3, drive_spreadsheet_id="FILEID")
     cfg_path.write_text(json.dumps(raw))
     capsys.readouterr()
 
     assert _init(cfg_path, tmp_path / "db", "--reset-config") == 0
     err = capsys.readouterr().err
     assert "reset the config" in err
-    for field in ("cache_ttl_seconds", "keep_backups", "drive_file_ids"):
+    for field in ("cache_ttl_seconds", "keep_backups", "drive_spreadsheet_id"):
         assert field in err, f"{field} was discarded without being named"
     after = Config.load(cfg_path)
-    assert (after.cache_ttl_seconds, after.keep_backups, after.drive_file_ids) == (5.0, 20, {})
+    assert (after.cache_ttl_seconds, after.keep_backups, after.drive_spreadsheet_id) == (
+        5.0, 20, "")
     assert after.actor == "", "--reset-config discards the stored actor too"
 
 
@@ -171,14 +172,53 @@ def test_the_row_wiping_flag_is_named_for_what_it_wipes(tmp_path):
     assert not cfg_path.exists()
 
 
-def test_the_destructive_flags_still_need_enabling_in_the_code(tmp_path):
-    """The operator's brake survives the rename."""
-    with pytest.raises(AssertionError):
-        cli.main(["--config", str(tmp_path / "c.json"), "init",
-                  "--root", str(tmp_path / "db"), "--reset-db"])
-    with pytest.raises(AssertionError):
-        cli.main(["--config", str(tmp_path / "c.json"), "init",
-                  "--root", str(tmp_path / "db"), "--seed"])
+def test_the_destructive_flags_are_gated_behind_admin(tmp_path, capsys):
+    """``--admin`` replaced a brake that lived in a commented-out assert.
+
+    The assert protected against nothing except being in a hurry, and left edited
+    checkouts behind. A flag says who decided, in the command line people paste when
+    something goes wrong -- and it still has to refuse before the command touches
+    anything, or the gate is a receipt rather than a barrier.
+    """
+    cfg_path = tmp_path / "c.json"
+    root = tmp_path / "db"
+
+    for flag in ("--seed", "--reset-db"):
+        rc = cli.main(["--config", str(cfg_path), "init", "--root", str(root), flag])
+        assert rc == 2, f"{flag} without --admin must not run"
+        err = capsys.readouterr().err
+        assert "--admin" in err, f"the refusal has to name the way through: {err}"
+        assert flag in err, "and name the flag it is refusing"
+    assert not cfg_path.exists(), "refused means nothing was written, config included"
+    assert not root.exists(), "refused means no tables directory either"
+
+
+def test_admin_lets_the_seed_run_and_says_what_it_wrote(tmp_path, capsys):
+    cfg_path = tmp_path / "c.json"
+    root = tmp_path / "db"
+    assert cli.main(["--config", str(cfg_path), "init", "--root", str(root),
+                     "--admin", "--seed"]) == 0
+    out = capsys.readouterr().out
+    assert "seeded" in out, "a seed that ran should report its row counts"
+    assert (root / "tables" / "items.csv").exists()
+
+
+def test_both_destructive_flags_are_named_together_when_both_are_missing(tmp_path, capsys):
+    rc = cli.main(["--config", str(tmp_path / "c.json"), "init",
+                   "--root", str(tmp_path / "db"), "--reset-db", "--seed"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "--seed and --reset-db" in captured.err, "both offenders, one refusal"
+    assert "are gated" in captured.err, "plural grammar for two flags"
+
+
+def test_the_gate_refuses_before_the_command_line_is_even_parsed_further(tmp_path, capsys):
+    """A bad ``--root`` would be a second error; the gate has to answer first."""
+    rc = cli.main(["--config", str(tmp_path / "c.json"), "init", "--seed"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "--root is required" not in err, "the gate speaks before the argument check"
+    assert "--admin" in err
 
 
 def test_an_unedited_config_reinitialises_quietly(tmp_path, capsys):

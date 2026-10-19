@@ -19,13 +19,46 @@ from .config import BACKENDS, Config, ConfigError, parse_drive_folder
 from .service import Service, ServiceError
 from .store.base import ForeignTableError, StoreError
 
+#: What ``--admin`` means, in the words a person reads before deciding to type it.
+#:
+#: One flag for both halves of setup because they are the same decision: "I am building
+#: this database, not working in it". Destructive writes and the Apps Script consent are
+#: wanted by the same person at the same moment, and nobody who is merely using a
+#: database wants either. It is deliberately per-invocation rather than a config value:
+#: an ordinary run should never inherit the ability to wipe a database because somebody
+#: once set a key while setting up.
+_ADMIN_HELP = ("this command is setting the database up rather than using it: allows "
+               "--seed and --reset-db, and asks Google for the setup-only scopes "
+               "(Apps Script) during authorisation")
+
+
+def _require_admin(args, *flags: str, effect: str = "") -> int:
+    """0 if allowed to go on, 2 with an explanation if not.
+
+    This used to be an ``assert`` someone had to comment out in the source, which
+    protected against nothing except being in a hurry, and left a trail of edited
+    checkouts behind. A named flag says who decided, and says it in the command line
+    that gets pasted into a chat when something goes wrong.
+
+    ``effect`` is a gerund phrase rather than a sentence, so the wording stays right
+    whether one flag was named or two.
+    """
+    named = [flag for flag in flags
+             if getattr(args, flag.lstrip("-").replace("-", "_"), False)]
+    if named and not getattr(args, "admin", False):
+        verb = "is" if len(named) == 1 else "are"
+        print(f"{getattr(args, 'command', 'this command')}: "
+              + " and ".join(named) + f" {verb} gated behind --admin"
+              + f" ({effect or 'overwriting what is already in the database'}).",
+              file=sys.stderr)
+        print("Re-run with --admin if you mean it. Otherwise stop here.", file=sys.stderr)
+        return 2
+    return 0
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    # The flags only exist on `init`, so reading them plainly raises AttributeError
-    # for every other subcommand -- including `serve`, which is the product.
-    assert not (getattr(args, "seed", False) or getattr(args, "reset_db", False)), "Seed and reset-db are destructive flags that must first be manually enabled in the code"
     try:
         return args.func(args)
     except ConfigError as e:
@@ -54,11 +87,14 @@ def _build_parser() -> argparse.ArgumentParser:
     init.add_argument("--backend", default="local", choices=BACKENDS)
     init.add_argument("--root", help="directory for tables/ exports/ backups/")
     init.add_argument("--drive-folder", help="Drive folder id or URL")
-    init.add_argument("--seed", action="store_true", help="fill with development fixture data")
+    init.add_argument("--seed", action="store_true",
+                      help="fill with development fixture data (needs --admin: it "
+                           "writes over whatever is already there)")
     init.add_argument("--reset-db", action="store_true",
-                      help="discard all existing rows first (for re-seeding a test "
-                           "database after an interrupted run; on Drive, version "
-                           "history is the only undo)")
+                      help="discard all existing rows first, for re-seeding a test "
+                           "database after an interrupted run (needs --admin; on "
+                           "Drive, version history is the only undo)")
+    init.add_argument("--admin", action="store_true", help=_ADMIN_HELP)
     init.add_argument("--reset-config", action="store_true",
                       help="write the config from this command line and the defaults, "
                            "discarding hand-edited values in the existing one (the "
@@ -69,7 +105,7 @@ def _build_parser() -> argparse.ArgumentParser:
                            "consent URL instead of opening a browser")
     init.add_argument("--port", type=int, default=8080,
                       help="loopback port for that consent redirect (default 8080)")
-    init.set_defaults(func=_cmd_init)
+    init.set_defaults(func=_cmd_init, command="init")
 
     show = sub.add_parser("show-config", help="print resolved configuration")
     show.set_defaults(func=_cmd_show_config)
@@ -88,12 +124,44 @@ def _build_parser() -> argparse.ArgumentParser:
     auth.add_argument("--force", action="store_true", help="re-authorise, ignoring any stored token")
     auth.add_argument("--check", action="store_true",
                       help="only verify the stored credentials; never prompt")
-    auth.set_defaults(func=_cmd_auth)
+    auth.add_argument("--admin", action="store_true",
+                      help="also ask for the setup-only scopes (Apps Script write "
+                           "access), needed by 'ui --install'. Consent cannot be "
+                           "widened in place, so this re-runs the whole flow")
+    auth.set_defaults(func=_cmd_auth, command="auth")
 
     doc = sub.add_parser("doctor", help="report integrity problems")
     doc.add_argument("--json", action="store_true")
     doc.add_argument("--quiet", action="store_true", help="only print the summary line")
     doc.set_defaults(func=_cmd_doctor)
+
+    ui = sub.add_parser(
+        "ui",
+        help="build the workbook's interface tabs: Start, database_errors, options",
+    )
+    ui.add_argument("--layout", action="store_true",
+                    help="only the form and its reference tab, leaving the error "
+                         "report exactly as it stands")
+    ui.add_argument("--problems", action="store_true",
+                    help="only refresh database_errors, leaving the form alone")
+    ui.add_argument("--reset", action="store_true",
+                    help="delete the tabs being regenerated and rebuild them from "
+                         "nothing, rather than writing over them. This is the only way "
+                         "to lose a merged range, a conditional format, a protection or "
+                         "a dropdown made by hand (needs --admin; the press buttons are "
+                         "images on Start and leave with it, and Drive's version history "
+                         "is the only undo)")
+    ui.add_argument("--check", action="store_true",
+                    help="say whether the published interface matches the current "
+                         "schema without writing anything")
+    ui.add_argument("--install", action="store_true",
+                    help="push this build's Apps Script into the workbook, creating or "
+                         "replacing the script project its buttons call. Needs --admin, "
+                         "and replaces anything hand-edited in that editor")
+    ui.add_argument("--admin", action="store_true",
+                    help="required with --install: writing a script project is a setup "
+                         "action, not something using the database should be able to do")
+    ui.set_defaults(func=_cmd_ui, command="ui")
 
     exp = sub.add_parser("export", help="write denormalised views and a SQLite mirror")
     exp.add_argument("--dir", default="", help="output root (default: the data root)")
@@ -151,6 +219,12 @@ def _load_config(args) -> Config:
 def _cmd_init(args) -> int:
     from .initdb import init_database
 
+    # Checked before anything is read or written: the point of the gate is that the
+    # command stops before it has done anything that needs undoing.
+    blocked = _require_admin(args, "--seed", "--reset-db")
+    if blocked:
+        return blocked
+
     # Start from the existing config so credential paths survive; override what
     # the user asked for on the command line. Reading the resolved default when
     # --config was omitted matters as much as reading the named file: `init`
@@ -168,12 +242,12 @@ def _cmd_init(args) -> int:
         base = Config()
 
     # Merge into the existing config rather than rebuilding it. The file can hold
-    # values no flag names -- `drive_file_ids` is authored by hand and is the only
-    # way to reach a table whose filename is not the canonical one -- and dropping
-    # one is not a cosmetic loss: that table then resolves to a freshly created empty
-    # file while the real one sits beside it, unread and unclaimed. So everything
-    # survives unless this command line actually named it, or `--reset-config` says
-    # otherwise out loud.
+    # values no flag names -- `drive_spreadsheet_id` is authored by hand and is the
+    # only way to reach a workbook that has been renamed out from under the lookup --
+    # and dropping one is not a cosmetic loss: the database then resolves to a
+    # freshly created empty workbook while the real one sits beside it, unread. So
+    # everything survives unless this command line actually named it, or
+    # `--reset-config` says otherwise out loud.
     wanted = (Config().to_dict() if args.reset_config else base.to_dict())
     wanted["backend"] = args.backend
     if args.actor:
@@ -215,8 +289,8 @@ def _cmd_init(args) -> int:
 
     # Progress goes to stderr so the report below stays clean to pipe, and only for
     # Drive: local setup reads a dozen files and is finished before you notice, so
-    # its silence is accurate. Over Drive the same work is a hundred-odd round trips
-    # and can run into minutes once the quota starts answering with 429s -- long
+    # its silence is accurate. Over Drive the same work crosses the network, and any
+    # one of those calls can sit in a quota backoff for a minute at a time -- long
     # enough that saying nothing is indistinguishable from being stuck.
     def progress(message: str) -> None:
         print(message, file=sys.stderr, flush=True)
@@ -295,21 +369,26 @@ def _authorise_drive(cfg, args) -> int:
     if not sys.stdin.isatty():
         path = cfg.save(args.config)
         named = f"--config {args.config} " if args.config else ""
+        # Carry --admin across the handoff. Dropping it is how a setup run ends up with
+        # a token that cannot install the interface, and the error for that arrives much
+        # later, in a different command.
+        admin = "--admin " if getattr(args, "admin", False) else ""
         print(f"config written   {path}")
         # stdout is block-buffered when piped, which would land that line after the
         # instructions below and make the handoff read backwards.
         sys.stdout.flush()
         print("no terminal here for the browser consent step, so it is left to you. "
               "In order:\n"
-              f"  inventory-mcp {named}auth     # once per machine; --manual if the "
-              "browser is on another computer\n"
+              f"  inventory-mcp {named}auth {admin.strip()}    # once per machine; "
+              "--manual if the browser is on another computer\n"
               "  then re-run this init command", file=sys.stderr)
         return 2
 
     print("running the one-time consent flow...")
     sys.stdout.flush()
     try:
-        token = authorize(cfg, manual=args.manual, port=args.port)
+        token = authorize(cfg, manual=args.manual, port=args.port,
+                          admin=getattr(args, "admin", False))
     except AuthError as exc:
         print(f"auth: {exc}", file=sys.stderr)
         return 2
@@ -328,9 +407,9 @@ def _announce_changes(old: Config, new: Config, *, reset: bool = False) -> None:
 
     This used to enumerate everything the file *lost*, because the whole file was
     rebuilt from the command line each time and hand-authored fields such as
-    ``drive_file_ids`` fell off with it. It merges now, so losing one takes the
+    ``drive_spreadsheet_id`` fell off with it. It merges now, so losing one takes the
     ``--reset-config`` flag -- and when it happens deliberately, every dropped value is
-    still listed, since that is the field whose loss can orphan a live table.
+    still listed, since that is the field whose loss can orphan a live database.
     """
     before, after = old.to_dict(), new.to_dict()
     changed = [f"{key}: {before[key]!r} -> {after[key]!r}"
@@ -360,7 +439,7 @@ def _cmd_serve(args) -> int:
 
 def _cmd_auth(args) -> int:
     """Drive authorisation. Separate from serve on purpose: stdio owns stdin."""
-    from .auth import AuthError, authorize, whoami
+    from .auth import ADMIN_SCOPES, AuthError, authorize, granted_scopes, whoami
 
     cfg = _load_config(args)
     if not cfg.is_drive:
@@ -370,15 +449,34 @@ def _cmd_auth(args) -> int:
         if args.check:
             info = whoami(cfg)
             print(f"credentials ok   {info.get('account') or info.get('kind')}")
+            have = granted_scopes(cfg)
+            for scope in have:
+                print(f"scope             {scope}")
+            gaps = [scope for scope in ADMIN_SCOPES if scope not in have]
+            if gaps:
+                print("the stored token does not cover: " + ", ".join(gaps)
+                      + "\nthat is only needed by 'ui --install'; to get it: "
+                        "inventory-mcp auth --admin --force", file=sys.stderr)
             if info.get("error"):
                 print(f"but the API call failed: {info['error']}", file=sys.stderr)
                 return 1
             return 0
-        path = authorize(cfg, manual=args.manual, port=args.port, force=args.force)
+        path = authorize(cfg, manual=args.manual, port=args.port, force=args.force,
+                         admin=getattr(args, "admin", False))
         print(f"credentials saved {path}")
         info = whoami(cfg)
         if info.get("account"):
             print(f"authorised as     {info['account']}")
+        # Say what was actually granted. The consent screen can be declined one box at
+        # a time, so "it worked" is not the same claim as "it covers Apps Script".
+        have = granted_scopes(cfg)
+        for scope in have:
+            print(f"scope             {scope}")
+        if getattr(args, "admin", False):
+            gaps = [scope for scope in ADMIN_SCOPES if scope not in have]
+            if gaps:
+                print("the setup scopes were not granted: " + ", ".join(gaps), file=sys.stderr)
+                return 1
         if info.get("error"):
             print(f"warning: could not reach the Drive API: {info['error']}", file=sys.stderr)
             return 1
@@ -408,6 +506,114 @@ def _cmd_doctor(args) -> int:
         print(f"\n{report['error_count']} error(s), {report['warning_count']} warning(s)"
               f" -> {'OK' if report['ok'] else 'NOT OK'}")
     return 0 if report["ok"] else 1
+
+
+def _install_ui_script(store) -> int:
+    """Push the packaged Apps Script into the workbook's bound project."""
+    from .auth import AuthError
+    from .uiscript import InstallError, install
+
+    book = store.workbook_id()
+    if not book:
+        print("ui: no workbook found in that folder; run 'inventory-mcp ui' first -- "
+              "the interface tabs are what the script reads", file=sys.stderr)
+        return 1
+
+    def say(message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
+
+    try:
+        done = install(store.config, book, progress=say)
+    except (AuthError, InstallError) as exc:
+        print(f"ui: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"script project   {done['script_id']} "
+          f"({'created' if done['created'] else 'updated'})")
+    print(f"wrote            {', '.join(done['files'])} ({done['bytes']} bytes)")
+    print(f"editor           {done['editor']}")
+    print("now reload the spreadsheet: the Lab inventory menu appears under "
+          "Extensions, and 'Add press buttons to Start' puts the buttons on the form.")
+    return 0
+
+
+def _cmd_ui(args) -> int:
+    """Regenerate the interface tabs. Derived content, so re-running is the fix."""
+    from . import sheetui
+
+    svc = Service.open(args.config)
+    store = svc.store
+    if not hasattr(store, "apply_layout"):
+        print(f"ui: {store.describe()} has no tabs to lay out; the interface belongs to "
+              "a Drive workbook", file=sys.stderr)
+        return 1
+
+    if getattr(args, "install", False):
+        blocked = _require_admin(
+            args, "--install",
+            effect="replacing whatever script is bound to this workbook")
+        if blocked:
+            return blocked
+        if args.check or args.layout or args.problems:
+            print("ui: --install writes the Apps Script and nothing else, so it is not "
+                  "combined with --check/--layout/--problems. Run them separately.",
+                  file=sys.stderr)
+            return 2
+        return _install_ui_script(store)
+
+    if args.check:
+        if args.reset:
+            print("ui: --check reads and writes nothing, so it cannot be combined with "
+                  "--reset.", file=sys.stderr)
+            return 2
+        found = sheetui.read_digest(store)
+        want = sheetui.layout_stamp()
+        if not found:
+            print(f"no interface published yet; run: inventory-mcp ui "
+                  f"(current digest {want})")
+            return 1
+        if found != want:
+            print(f"interface is stale: published against {found}, current schema is "
+                  f"{want}\nrun: inventory-mcp ui")
+            return 1
+        print(f"interface is current ({want})")
+        return 0
+
+    # Naming either flag narrows the run to that half; naming neither does both. The
+    # default matters more than the flags, because the ordinary case is "set the whole
+    # thing up again the way the schema says it should be".
+    layout = problems = True
+    if args.layout or args.problems:
+        layout, problems = args.layout, args.problems
+
+    if args.reset:
+        blocked = _require_admin(
+            args, "--reset",
+            effect="deleting the interface tabs and rebuilding them from nothing")
+        if blocked:
+            return blocked
+
+    result = sheetui.publish(svc, layout=layout, problems=problems, reset=args.reset,
+                             progress=print)
+    print("wrote " + ", ".join(result["tabs"]))
+    if result["discarded"]:
+        print("reset: discarded " + ", ".join(
+            f"{rows} row(s) from {tab}" for tab, rows in sorted(result["discarded"].items())))
+        if "Start" in result["discarded"]:
+            print("       the press buttons left with Start; Lab inventory -> "
+                  "'Add press buttons to Start' puts them back")
+    if result["layout_requests"]:
+        print(f"layout: {result['layout_requests']} requests in one batch, "
+              f"{result['start_rows']} rows of form")
+    if result["errors"] is not None:
+        print(f"database_errors: {result['errors']} error(s), "
+              f"{result['warnings']} warning(s)")
+    if result["fresh"]:
+        print(f"digest {result['digest']} (first publish for this schema)")
+    elif result["was_stale"]:
+        print(f"digest {result['digest']} (regenerated: the workbook was laid out "
+              "against something older)")
+    return 0
 
 
 def _cmd_export(args) -> int:

@@ -12,6 +12,20 @@ class TestUnits:
         assert units.to_canonical("volume", 1.0, "ml") == (1000.0, "ul")
         assert units.to_canonical("volume", 2.0, "ul") == (2.0, "ul")
 
+    def test_every_metric_prefix_lands_where_the_prefix_says(self):
+        """The prefix table is assembled by hand after a generated one, so pin it.
+
+        ``_prefixed`` walks its prefix tuple in order and multiplies by 1000 each
+        step, which is right for m->u->n only if the caller listed them ascending --
+        and it isn't. The result used to be ``nl = 1e12``, accepted without complaint
+        because an unknown unit raises while a wrong factor just quietly converts.
+        """
+        ladder = {"l": 1e6, "ml": 1e3, "ul": 1e0, "nl": 1e-3, "pl": 1e-6}
+        for unit, factor in ladder.items():
+            assert units.to_canonical("volume", 1.0, unit) == (factor, "ul"), unit
+        for unit, factor in {"g": 1e9, "mg": 1e6, "ug": 1e3, "ng": 1e0, "pg": 1e-3}.items():
+            assert units.to_canonical("mass", 1.0, unit) == (factor, "ng"), unit
+
     def test_micro_sign_variants_are_equivalent(self):
         assert units.to_canonical("volume", 5.0, "µl") == units.to_canonical("volume", 5.0, "ul")
 

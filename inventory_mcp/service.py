@@ -13,6 +13,7 @@ writing means an accepted write can always be undone by copying files back.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -242,6 +243,8 @@ class Service:
         self.store = store or make_store(config)
         self._db: Optional[dbmod.Database] = None
         self._violations: list[validation.Violation] = []
+        self._bulk_depth = 0
+        self._bulk_snapshot: Optional[Snapshot] = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -2633,6 +2636,26 @@ class Service:
 
     # -- the commit funnel ---------------------------------------------------
 
+    @contextlib.contextmanager
+    def bulk(self, operation: str = "bulk"):
+        """One pre-write copy for a run of commits, instead of one copy per commit.
+
+        Seeding and resetting are single decisions -- fill this database, empty it --
+        and thirty workbook copies to undo one of them is both noise and thirty extra
+        requests against a quota that is already tight. The copy taken on entry is the
+        state before the first commit, which is the state anybody would want back.
+        """
+        if self._bulk_depth == 0:
+            self._bulk_snapshot = self._snapshot(
+                [t.name for t in schema.TABLES], operation)
+        self._bulk_depth += 1
+        try:
+            yield self._bulk_snapshot
+        finally:
+            self._bulk_depth -= 1
+            if self._bulk_depth == 0:
+                self._bulk_snapshot = None
+
     def _apply(self, operation: str, changes) -> CommitResult:
         """Single write path.
 
@@ -2683,20 +2706,24 @@ class Service:
             standing = {validation.key(v) for v in validation.errors(validation.validate(self.db))}
             raise ValidationError(bad, [v for v in bad if validation.key(v) not in standing])
 
-        snapshot = self._snapshot(touched, operation)
-        new_revisions: dict[str, str] = {}
+        snapshot = self._bulk_snapshot or self._snapshot(touched, operation)
+        batch = []
+        for name in touched:
+            t = candidate.tables[name]
+            rows = [{k: v for k, v in r.items() if k != EXTRA_COLUMNS_KEY} for r in t.rows]
+            batch.append((name, t.header, rows, t.revision or None))
+        landed: dict[str, str] = {}
         try:
-            for name in touched:
-                t = candidate.tables[name]
-                rows = [{k: v for k, v in r.items() if k != EXTRA_COLUMNS_KEY} for r in t.rows]
-                new_rev = self.store.write_table(name, t.header, rows, t.revision or None)
-                new_revisions[name] = new_rev
+            # One call for the whole commit where the backend can carry one. A commit
+            # that touches items and samples used to pay per-table round trips for
+            # its compare-and-swap, its write and its confirmation each.
+            new_revisions = self.store.write_batch(batch, written=landed)
         except StoreError as e:
-            # A commit that cannot finish must leave nothing half-landed: any
-            # table already pushed by this loop goes back to its pre-commit
-            # content. Live finding: the CAS failure used to surface only after
-            # the earlier tables had been written, orphaning rows across tables.
-            reverted, stuck = self._rollback(new_revisions)
+            # A commit that cannot finish must leave nothing half-landed: any table
+            # the store reported as landed goes back to its pre-commit content. Live
+            # finding: the CAS failure used to surface only after the earlier tables
+            # had been written, orphaning rows across tables.
+            reverted, stuck = self._rollback(landed)
             detail = ""
             if reverted:
                 detail += f"\nReverted: {', '.join(reverted)}."
@@ -2751,10 +2778,15 @@ class Service:
         """Copy the pre-write content of the tables we are about to change.
 
         This is the undo affordance: no event journal, but any accepted write can
-        be reverted by copying these files back. Only available when storage is a
-        local directory; remote backends report it honestly rather than pretending.
+        be reverted by copying these back. Two shapes, because storage comes two ways:
+        a local directory gets a folder of CSV copies, a remote backend that keeps the
+        whole database in one file gets a copy of that file. A store offering neither
+        reports ``path=None`` rather than pretending.
         """
         names = [t for t in tables]
+        remote = getattr(self.store, "snapshot", None)
+        if callable(remote):
+            return Snapshot(path=remote(names, operation), tables=tuple(names))
         root = getattr(self.store, "root", None)
         if root is None:
             return Snapshot(path=None, tables=tuple(names))

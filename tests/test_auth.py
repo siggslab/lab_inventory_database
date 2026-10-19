@@ -103,6 +103,7 @@ class _FakeFlow:
     """Stands in for InstalledAppFlow, recording how the exchange was requested."""
 
     last = None
+    requested_scopes = None
 
     def __init__(self):
         self.redirect_uri = ""
@@ -111,6 +112,9 @@ class _FakeFlow:
 
     @classmethod
     def from_client_secrets_file(cls, path, scopes):
+        # What the consent screen would offer. The whole point of --admin is that this
+        # differs between an ordinary run and a setup run, so it has to be observable.
+        _FakeFlow.requested_scopes = list(scopes)
         return cls()
 
     def authorization_url(self, **kwargs):
@@ -238,3 +242,245 @@ def test_a_refused_exchange_blames_google_not_the_paste(monkeypatch):
     assert "code_expired" in str(excinfo.value), "the server's reason has to survive"
     assert "pasted the whole" not in str(excinfo.value), (
         "the paste was complete and correct; the old wording sent people back to it")
+
+
+# ---------------------------------------------------------------------------
+# the setup-only scopes
+# ---------------------------------------------------------------------------
+
+
+def _token_file(tmp_path, scopes):
+    """A stored grant, so the code under test reads what a consent actually left.
+
+    The expiry has to be in the future: google-auth treats a token with no expiry as
+    expired, which sends ``credentials()`` off to refresh against a fake client id and
+    fails for reasons that have nothing to do with the scope being tested.
+    """
+    path = tmp_path / "oauth_token.json"
+    path.write_text(json.dumps({
+        "token": "ya29.fake-access-token",
+        "refresh_token": "fake-refresh",
+        "client_id": "client.apps.googleusercontent.com",
+        "client_secret": "secret",
+        "expiry": "2999-01-01T00:00:00Z",
+        "scopes": list(scopes),
+        "type": "authorized_user",
+    }), encoding="utf-8")
+    return path
+
+
+def _drive_config(token_path):
+    return Config(backend="drive", drive_folder_id="FOLDER",
+                  token_path=str(token_path), service_account_path="")
+
+
+def test_using_a_database_never_asks_for_apps_script():
+    """The default list is what every bench person sees on their consent screen.
+
+    Apps Script write access there would be a second permission offered to people who
+    have no way to use it -- and on an unverified app each extra box is another reason
+    for Google's interstitial to matter.
+    """
+    from inventory_mcp.auth import ADMIN_SCOPES, scopes_for
+
+    assert scopes_for() == SCOPES
+    assert not set(SCOPES) & set(ADMIN_SCOPES)
+
+
+def test_admin_adds_the_setup_scopes_and_keeps_the_everyday_ones():
+    from inventory_mcp.auth import ADMIN_SCOPES, scopes_for
+
+    assert scopes_for(admin=True) == SCOPES + ADMIN_SCOPES, (
+        "an admin grant replaces the Drive scope rather than adding to it, which would "
+        "break every ordinary command afterwards")
+
+
+def test_the_flow_asks_google_for_exactly_what_the_flag_asked_for(monkeypatch):
+    """The flag has to reach the consent URL, not just the local scope check."""
+    from inventory_mcp import auth
+    from inventory_mcp.auth import ADMIN_SCOPES, scopes_for
+
+    monkeypatch.setattr("builtins.input", lambda prompt="": PASTED)
+
+    auth._run_flow(_FakeFlow, Path("unused.json"), manual=True, port=8080,
+                   scopes=scopes_for())
+    plain = list(_FakeFlow.requested_scopes)
+    assert ADMIN_SCOPES[0] not in plain
+
+    auth._run_flow(_FakeFlow, Path("unused.json"), manual=True, port=8080,
+                   scopes=scopes_for(admin=True))
+    assert _FakeFlow.requested_scopes == plain + ADMIN_SCOPES, (
+        "an admin run asks for more, and asks for it on top of the everyday scope")
+
+
+def test_a_drive_only_token_is_refused_for_setup_and_names_the_command(tmp_path):
+    """Google's own answer here is "insufficient authentication scopes" about a token
+    that is perfectly valid -- useless to anyone reading it. Catch it locally."""
+    from inventory_mcp.auth import ADMIN_SCOPES, SCOPES as base
+
+    cfg = _drive_config(_token_file(tmp_path, base))
+    with pytest.raises(AuthError) as excinfo:
+        credentials(cfg, interactive=False, admin=True)
+    message = str(excinfo.value)
+    assert ADMIN_SCOPES[0] in message, "name the permission that is missing"
+    assert "--admin" in message and "--force" in message, (
+        "and the exact re-run, because consent cannot be widened in place")
+
+
+def test_an_ordinary_call_still_works_on_a_wider_token(tmp_path):
+    """The point of additive grants: getting the setup scope must not cost somebody
+    their everyday access."""
+    from inventory_mcp.auth import ADMIN_SCOPES, SCOPES as base
+
+    cfg = _drive_config(_token_file(tmp_path, base + ADMIN_SCOPES))
+    creds = credentials(cfg, interactive=False)
+    assert creds.valid
+
+
+def test_granted_scopes_reads_the_file_because_the_object_cannot_be_trusted(tmp_path):
+    """The trap this avoids, pinned so nobody "simplifies" it back.
+
+    ``Credentials.from_authorized_user_file(path, scopes)`` assigns the scopes *you
+    passed in* onto the credential. Asking it for the Drive scope therefore hands back
+    an object claiming the Drive scope whatever was consented to -- comparing that with
+    what we asked for compares a value with itself and always passes.
+    """
+    from google.oauth2.credentials import Credentials
+
+    from inventory_mcp.auth import ADMIN_SCOPES, SCOPES as base, granted_scopes, recorded_scopes
+
+    path = _token_file(tmp_path, base)
+    lying = Credentials.from_authorized_user_file(str(path), [ADMIN_SCOPES[0]])
+    assert lying.scopes == [ADMIN_SCOPES[0]], (
+        "if this ever stops being true, the file-reading below can be deleted")
+
+    cfg = _drive_config(path)
+    assert granted_scopes(cfg) == sorted(base)
+    assert recorded_scopes(path) == list(base)
+
+
+def test_a_token_that_records_nothing_is_not_guessed_at(tmp_path):
+    """An older or hand-written file may carry no scopes. Asserting a gap there would
+    refuse a working token; Google gets to be the authority instead."""
+    from inventory_mcp.auth import recorded_scopes
+
+    path = tmp_path / "oauth_token.json"
+    path.write_text(json.dumps({"token": "t", "refresh_token": "r",
+                                "client_id": "c", "client_secret": "s",
+                                "expiry": "2999-01-01T00:00:00Z",
+                                "type": "authorized_user"}), encoding="utf-8")
+    assert recorded_scopes(path) is None
+    # ... and an admin call against it proceeds rather than inventing a refusal.
+    creds = credentials(_drive_config(path), interactive=False, admin=True)
+    assert creds.valid
+
+
+def test_granted_scopes_of_a_missing_file_is_nothing_to_report(tmp_path):
+    from inventory_mcp.auth import granted_scopes
+
+    assert granted_scopes(_drive_config(tmp_path / "absent.json")) == []
+
+
+def test_a_refresh_during_an_ordinary_command_keeps_the_wide_grant(tmp_path, monkeypatch):
+    """The write direction of the lying-scopes trap.
+
+    ``from_authorized_user_file(path, wanted)`` stamps *wanted* onto the credential, so a
+    command that has to refresh would save back a scope list describing only what it asked
+    for. An admin grant would then evaporate from the record on any day the access token
+    happened to be stale, and the next setup run would demand a consent nobody revoked --
+    which is exactly how a working wide token came to look narrow here.
+    """
+    from inventory_mcp import auth
+    from inventory_mcp.auth import ADMIN_SCOPES, SCOPES as base, recorded_scopes
+
+    path = tmp_path / "oauth_token.json"
+    path.write_text(json.dumps({
+        "token": "ya29.stale", "refresh_token": "fake-refresh",
+        "client_id": "c", "client_secret": "s",
+        "expiry": "2000-01-01T00:00:00Z",          # expired, so a refresh is forced
+        "scopes": sorted(base + ADMIN_SCOPES), "type": "authorized_user",
+    }), encoding="utf-8")
+
+    class Refreshed:
+        """A credential that reports back whatever scopes it was handed at load."""
+
+        def __init__(self, scopes):
+            self.scopes = list(scopes)
+            self.refresh_token = "fake-refresh"
+            self.expired = True
+            self.valid = False
+
+        @classmethod
+        def from_authorized_user_file(cls, path, scopes):
+            return cls(scopes)
+
+        def refresh(self, request):
+            self.expired = False
+            self.valid = True
+
+        def to_json(self):
+            return json.dumps({"token": "ya29.fresh", "refresh_token": self.refresh_token,
+                               "client_id": "c", "client_secret": "s",
+                               "expiry": "2999-01-01T00:00:00Z",
+                               "scopes": self.scopes, "type": "authorized_user"})
+
+    monkeypatch.setattr(auth, "_require_oauth", lambda: (object, Refreshed, object))
+
+    creds = credentials(_drive_config(path), interactive=False)  # an ordinary, non-admin call
+    assert creds.valid
+    assert recorded_scopes(path) == sorted(base + ADMIN_SCOPES), (
+        "the record has to outlive a refresh that only ever knew about Drive")
+
+
+def test_a_narrow_record_is_checked_against_the_server_before_refusing(tmp_path, monkeypatch):
+    """The record can be narrower than the grant behind it, and refusing on that alone
+    sends somebody to a browser to re-approve something they already approved.
+
+    This is the repair path for exactly the state this machine got into: the token could
+    still mint ``script.projects`` -- proven against Google directly -- while the file said
+    Drive only, because the library serialises what was asked for rather than what came back.
+    """
+    from inventory_mcp import auth
+    from inventory_mcp.auth import ADMIN_SCOPES, SCOPES as base, recorded_scopes
+
+    path = tmp_path / "oauth_token.json"
+    path.write_text(json.dumps({
+        "token": "ya29.fresh-enough", "refresh_token": "fake-refresh",
+        "client_id": "c", "client_secret": "s",
+        "expiry": "2999-01-01T00:00:00Z",          # valid, so nothing refreshes on its own
+        "scopes": list(base),                      # the damaged, too-narrow record
+        "type": "authorized_user",
+    }), encoding="utf-8")
+
+    class Probed:
+        """Loaded with whatever was asked; the server's reply arrives on refresh."""
+
+        def __init__(self, scopes):
+            self.scopes = list(scopes)
+            self.granted_scopes = None
+            self.refresh_token = "fake-refresh"
+            self.expiry = None
+            self.valid = True
+            self.expired = False
+
+        @classmethod
+        def from_authorized_user_file(cls, path, scopes):
+            return cls(scopes)
+
+        def refresh(self, request):
+            self.granted_scopes = sorted(base + ADMIN_SCOPES)   # what Google actually honours
+            self.valid = True
+            self.expired = False
+
+        def to_json(self):
+            return json.dumps({"token": "ya29.minted", "refresh_token": self.refresh_token,
+                               "client_id": "c", "client_secret": "s",
+                               "expiry": "2999-01-01T00:00:00Z",
+                               "scopes": self.scopes, "type": "authorized_user"})
+
+    monkeypatch.setattr(auth, "_require_oauth", lambda: (object, Probed, object))
+
+    creds = credentials(_drive_config(path), interactive=False, admin=True)
+    assert creds.valid, "no fresh consent was needed; the grant was there all along"
+    assert recorded_scopes(path) == sorted(base + ADMIN_SCOPES), (
+        "and the record gets repaired on the way past, not just forgiven")

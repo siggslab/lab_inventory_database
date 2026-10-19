@@ -32,7 +32,9 @@ include = ["inventory_mcp*"]
 [tool.setuptools.package-data]
 # The lab's OAuth client, which auth falls back to when the user has no copy of
 # their own. Without this it lives in a checkout but vanishes from a wheel.
-inventory_mcp = ["client_secret.json"]
+# The Apps Script source ships for the same reason: `ui --install` pushes these
+# bytes into a workbook, so a wheel without them can only tell you to go find a checkout.
+inventory_mcp = ["client_secret.json", "*.gs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

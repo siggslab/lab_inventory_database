@@ -147,22 +147,33 @@ def load(store) -> tuple[Database, list["Violation"]]:  # noqa: F821
     tables: dict[str, Table] = {}
     violations: list[Violation] = []
 
+    # One bulk read where the backend can do one. A backend that cannot -- a file per
+    # table -- raises on the first absent file rather than answering, and falling back
+    # to the table-by-table path below keeps a missing file a warning instead of
+    # turning the whole database unreadable.
+    try:
+        bulk = store.read_all()
+    except StoreError:
+        bulk = {}
+
     for spec in schema.TABLES:
-        try:
-            data: TableData = store.read_table(spec.name)
-        except StoreError:
-            tables[spec.name] = empty_table(spec.name)
-            violations.append(
-                Violation(
-                    table=spec.name,
-                    row_id="",
-                    field="",
-                    code="table_missing",
-                    severity="warning",
-                    message=f"{spec.filename} not present in storage; treating as empty",
+        data: Optional[TableData] = bulk.get(spec.name)
+        if data is None:
+            try:
+                data = store.read_table(spec.name)
+            except StoreError:
+                tables[spec.name] = empty_table(spec.name)
+                violations.append(
+                    Violation(
+                        table=spec.name,
+                        row_id="",
+                        field="",
+                        code="table_missing",
+                        severity="warning",
+                        message=f"{spec.filename} not present in storage; treating as empty",
+                    )
                 )
-            )
-            continue
+                continue
         tables[spec.name] = _build(spec, data)
 
     strays = tuple(sorted(set(store.list_tables()) - set(tables)))

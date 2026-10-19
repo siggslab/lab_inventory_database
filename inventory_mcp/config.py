@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -76,8 +76,10 @@ class Config:
     local_root: str = ""
     #: Drive folder id when backend startswith "drive_"
     drive_folder_id: str = ""
-    #: logical table name -> Drive file id, for when filenames collide
-    drive_file_ids: dict[str, str] = field(default_factory=dict)
+    #: the workbook holding every table, when the name lookup cannot be trusted --
+    #: somebody renamed it, or two databases share a folder. One value, because the
+    #: layout is one spreadsheet; it used to be a mapping per table.
+    drive_spreadsheet_id: str = ""
     token_path: str = str(DEFAULT_TOKEN_PATH)
     client_secret_path: str = str(DEFAULT_CLIENT_SECRET_PATH)
     #: if this key exists it wins over the OAuth flow -- useful on a shared
