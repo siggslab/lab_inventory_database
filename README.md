@@ -7,7 +7,8 @@ on a shared google drive (which additionally is how access control is handled).
 
 This database contains an MCP layer, allowing models to interact with the database in
 constrained ways, and a Services layer which provide python bindings to the same tools,
-allowing easy creation of a dashboard for a user by those same models.
+allowing easy creation of a dashboard for a user by those same models. Also, on google drive
+the spreadsheet is given a landing page with functions and buttons 
 
 Additionally, as the database is backed by human readable files, it is designed so that
 reading and editing it manually is possible, if not recommended. If mal-formatted edits
@@ -20,7 +21,7 @@ and install this project into the venv
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e '.[drive,dev]'          # add ,[drive] for the Google Drive backends
+pip install -e '.[drive,dev]'          # add ,[drive] for the Google Drive backends. Add dev if you'll be adding a dashboard
 ```
 
 ## Setup against the lab's Drive folder
@@ -32,10 +33,13 @@ before your machine can use a remotely stored database
 
 **1. Initialisation.**
 
-Create a congfig file with the init command, specifying the use of the google-drive based backend
+Create a config file with the init command, specifying the use of the google-drive based backend
 and a folder. If you wish to use one that already exists: configuration is read from
 `--config <path>` (the flag goes before the subcommand), then`~/.config/inventory-mcp/config.json`,
 then `$INVENTORY_MCP_CONFIG`.
+
+If you are not authenticated, and use the drive backend, init will also ask for authentication to allow the
+program to read from the google drive being used a backend 
 
 ```bash
 inventory-mcp init --backend drive \
@@ -43,33 +47,39 @@ inventory-mcp init --backend drive \
 inventory-mcp show-config
 ```
 
-`init` additionally will open the folder its pointed to and create the tables needed for the database.
-In an existing database it adds only the tables that are missing.
+`init` will open the folder its pointed to and create the tables needed for the database.
 
 The `--seed` param can be passed to generate dummy testing data for the tables at initialisation. 
 The `--reset-db` param can be passed to discards every entry in the database. and re-initialise it from scratch.
 
-**Destructive Flags**
+**Destructive Flags and the Admin flag**
 Note, as these two flags (seed, and particularly reset) are not used outside a development context, and 
 have the potential to wipe the database, and because users will likely be pointing this at an in-use shared 
-google drive with write permissions, these two flags are disabled by default and will just produce an error.
-They must first be intentionally enabled in the cli.py file first.
+google drive with write permissions, these two flags are locked behind the additional --admin flag, which declares that
+you have the right to modify the database outside of standard user edits. 
+
+With a drive backend the admin flag also requests permissions for the google scripts api. This is used to setup the 
+landing page for opening the database as a file. In this landing page, a user can press a button to add/edit samples,
+which needs scripts.
 
 **2. Google authentication**
 
-Create a token that authenticates this program with your account, allowing it to read/write to the
-shared drive
+Authentication is actually handled at the init step, but if that fails for whatever reason, of if a user's token
+expires and you need to re-authenticate, this command can do that.
 
 ```bash
 source .venv/bin/activate
-inventory-mcp auth            # opens a browser on this machine
-inventory-mcp auth --check    # verify the stored token without prompting
+inventory-mcp auth --check    # 
 ```
+To check authentication status, and 
+
+```bash
+inventory-mcp auth          
+```
+to actually authenticate.
+
 This automatically opens an authorisation prompt in browser. If you want to do this manually, you can pass the
 `--manual` flag and get a url to visit for authentication instead
-```bash
-inventory-mcp auth --manual   # headless: prints the URL, you paste the redirect back
-```
 
 The token is cached at `~/.config/inventory-mcp/oauth_token.json`, mode `0600`. 
 
@@ -117,24 +127,23 @@ will be skipped
 ```bash
 # create the table files. Note, unlike in other commands that read the config file, this one *writes*
 # the config file to this location
-inventory-mcp --config ./db.config.json init --root ./db --actor you
+inventory-mcp init --root ./db --actor you
 
 # look at it
-inventory-mcp --config ./db.config.json ls                  # items
-inventory-mcp --config ./db.config.json ls --containers
-inventory-mcp --config ./db.config.json occupancy           # fill levels
-inventory-mcp --config ./db.config.json doctor              # integrity report
+inventory-mcp ls                  # items
+inventory-mcp ls --containers
+inventory-mcp occupancy           # fill levels
+inventory-mcp doctor              # integrity report
 
 # ask a question in SQL
-inventory-mcp --config ./db.config.json query \
+inventory-mcp query \
   "select project_name, count(*) n from items_wide where class='sample' group by 1"
 
 # publish flat views + a SQLite mirror for anything else to read
-inventory-mcp --config ./db.config.json export
+inventory-mcp export
 ```
 
 Then point an MCP client at it:
-
 ```json
 {
   "mcpServers": {
@@ -151,7 +160,7 @@ it. See [docs/tools.md](docs/tools.md) for the conventions behind it.
 
 ## Database structure
 
-There are twelve tables:
+There are twelve sheets, which are separate files in csv mode:
 
 ```
 containers        Objects which store other objects, and their hierachy e.g. freezer > shelf > rack > box, plus fridge/bench
@@ -167,6 +176,13 @@ item_links        Table linking items relations to each other. Such as a DNA tub
 assays            Table listing kinds of measurement that may be applied to items (e.g. volume). Needed for database reasons
 measurements      List of measurements as applied to items, with history. 
 ```
+
+Sheets mode includes two additional sheets which are used as an entrypoint for manual edits
+```
+Start             Contains a number of functions for editing the database. Enter fields in specified boxes, then press a button to submit
+database_errors   Shows the output of a doctor command, to show what's currently malformatted in the database
+```
+
 
 Structural dev notes:
 
@@ -231,20 +247,20 @@ JSON at `~/.config/inventory-mcp/config.json`, or `$INVENTORY_MCP_CONFIG`, or
 
 ## Command line Reference
 
-| Command | Purpose                                                                                                                                      |
-| --- |----------------------------------------------------------------------------------------------------------------------------------------------|
-| `init` | Initialises config and create database tables (`--root`, `--seed`, `--reset-db`, `--reset-config`, `--backend`, `--drive-folder`, `--actor`) |
-| `auth` | Drive consent once (`--manual`, `--port`, `--force`, `--check`)                                                                              |
-| `serve` | run the MCP server over stdio                                                                                                                |
-| `doctor` | integrity report; exit 1 when errors exist (`--json`, `--quiet`)                                                                             |
-| `ls` | list items, or `--containers`                                                                                                                |
-| `occupancy` | fill levels per container (`[container_id]`, `--kind`)                                                                                       |
-| `enrol` | give each sample's pairing its own enrolment row (`--from-ancestors`, `--dry-run`)                                                           |
-| `query` | guarded read-only SQL                                                                                                                        |
-| `export` | flat CSV views + SQLite mirror + manifest                                                                                                    |
-| `schema` | the field-by-field reference (`--json`)                                                                                                      |
-| `tools` | the live tool catalogue (`--json`)                                                                                                           |
-| `show-config` | resolved configuration                                                                                                                       |
+| Command | Purpose                                                                                                                                                 |
+| --- |---------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `init` | Initialises config and create database tables (`--root`, `--admin`, `--seed`, `--reset-db`, `--reset-config`, `--backend`, `--drive-folder`, `--actor`) |
+| `auth` | Drive consent once (`--manual`, `--port`, `--force`, `--check`)                                                                                         |
+| `serve` | run the MCP server over stdio                                                                                                                           |
+| `doctor` | integrity report; exit 1 when errors exist (`--json`, `--quiet`)                                                                                        |
+| `ls` | list items, or `--containers`                                                                                                                           |
+| `occupancy` | fill levels per container (`[container_id]`, `--kind`)                                                                                                  |
+| `enrol` | give each sample's pairing its own enrolment row (`--from-ancestors`, `--dry-run`)                                                                      |
+| `query` | guarded read-only SQL                                                                                                                                   |
+| `export` | flat CSV views + SQLite mirror + manifest                                                                                                               |
+| `schema` | the field-by-field reference (`--json`)                                                                                                                 |
+| `tools` | the live tool catalogue (`--json`)                                                                                                                      |
+| `show-config` | resolved configuration                                                                                                                                  |
 
 ## Building a dashboard on this
 
